@@ -4,39 +4,89 @@ import { pathKey } from "../../../shared/lib/paths";
 import type { ApprovalDecision, HarnessEvent } from "../../../integrations/harness/core/types";
 import { pendingApprovalForSession } from "../../notifications/model/approvalToast";
 import type { UserQuestionReply } from "../../sessions/model/userQuestion";
+import type { CheckRunResult } from "../../../platform/tauri/orchestrationNative";
 import {
+  validateOrchestrationBrief,
   validateOrchestrationSettings,
   validateProposedTasks,
+  validateTaskChecks,
+  validateTaskKind,
   type OrchestrationChoice,
   type OrchestrationProposal,
 } from "./orchestrationPlan";
 import {
+  CHECK_OUTPUT_CHARS,
+  busyTask,
   normalizeOrchestrationRun,
   orchestrationCheckoutCwd,
+  orchestrationLimits,
   orchestrationWorkspace,
+  settleActiveTime,
   workspaceIdentity,
+  type CheckResult,
   type OrchestrationDispatch,
   type OrchestrationRun,
   type OrchestrationTask,
   type OrchestrationWorkspace,
+  type WorkerChange,
 } from "./orchestrationState";
+import {
+  resolveOrchestrationLimits,
+  validateOrchestrationBudget,
+  type OrchestrationBudget,
+  type OrchestrationLimits,
+} from "./orchestrationLimits";
+import {
+  MAX_RECORDED_CHANGES,
+  leadResultFields,
+  leadResultText,
+  parseWorkerReport,
+  reviewVerdict,
+} from "./orchestrationReport";
+import {
+  orchestrationUsage,
+  orchestrationUsageText,
+} from "./orchestrationSummary";
 
 export {
+  busyTask,
   orchestrationCheckoutCwd,
+  orchestrationLimits,
   orchestrationProjectCwd,
   orchestrationWorkspace,
   workspaceIdentity,
 } from "./orchestrationState";
+export {
+  DEFAULT_ORCHESTRATION_LIMITS,
+  ORCHESTRATION_BUDGET_RANGES,
+  ORCHESTRATION_LIMIT_RANGES,
+  resolveOrchestrationLimits,
+  validateOrchestrationBudget,
+} from "./orchestrationLimits";
 export type {
+  OrchestrationBudget,
+  OrchestrationLimits,
+} from "./orchestrationLimits";
+export {
+  changeMismatch,
+  parseWorkerReport,
+} from "./orchestrationReport";
+export type {
+  CheckResult,
   DispatchStage,
   DispatchState,
   OrchestrationDispatch,
   OrchestrationRun,
   OrchestrationTask,
   OrchestrationWorkspace,
+  TaskKind,
   TaskStatus,
+  WorkerChange,
+  WorkerCheck,
+  WorkerReport,
   WorkspacePolicy,
 } from "./orchestrationState";
+export type { CheckRunResult } from "../../../platform/tauri/orchestrationNative";
 export type ControlOutcome = {
   status: "completed" | "failed" | "cancelled";
   text: string;
@@ -46,6 +96,14 @@ export type WorkerPreparation = {
   scratchDir?: string;
   workspace: OrchestrationWorkspace;
 };
+export type WorkerDiff = {
+  files: WorkerChange[];
+  /** Unified diff, cut at the requested size. */
+  patch: string;
+  truncated: boolean;
+};
+/** Bounds of the diff action's maxBytes; requests outside are clamped. */
+export const DIFF_BYTES = { default: 60_000, min: 1000, max: 200_000 } as const;
 export type OrchestrationHost = {
   session(id: string): Session | undefined;
   sessions(): Session[];
@@ -57,7 +115,30 @@ export type OrchestrationHost = {
   integrateWorker(
     run: OrchestrationRun,
     task: OrchestrationTask,
-  ): Promise<{ files: string[]; alreadyApplied: number }>;
+  ): Promise<{ files: string[]; alreadyApplied: number; merged?: string[] }>;
+  /**
+   * Run one acceptance check in the task's checkout. Resolves with a failed
+   * result on a non-zero exit or timeout; rejects only when it cannot run.
+   */
+  runCheck(
+    run: OrchestrationRun,
+    task: OrchestrationTask,
+    command: string,
+  ): Promise<CheckRunResult>;
+  /**
+   * Files the worker's session changed in its checkout. Optional and
+   * best-effort: a failure leaves the task without recorded changes.
+   */
+  workerChanges?(
+    run: OrchestrationRun,
+    task: OrchestrationTask,
+  ): Promise<WorkerChange[]>;
+  /** The worker session's patch in its checkout, cut at `maxBytes`. */
+  workerDiff(
+    run: OrchestrationRun,
+    task: OrchestrationTask,
+    maxBytes: number,
+  ): Promise<WorkerDiff>;
   /** Returns false when unreviewed changes require the worktree to be kept. */
   cleanupWorker(
     run: OrchestrationRun,
@@ -79,6 +160,17 @@ export type OrchestrationHost = {
     decision: ApprovalDecision,
   ): void;
   answerQuestion(id: string, requestId: number, reply: UserQuestionReply): void;
+};
+type ApprovedStart = {
+  proposalId: string;
+  allowedModels: OrchestrationChoice[];
+  tasks: OrchestrationTask[];
+  brief?: string;
+};
+/** Run settings chosen at start; a resume keeps the previous ones unless passed. */
+export type OrchestrationRunOptions = {
+  autoAccept?: boolean;
+  budget?: OrchestrationBudget;
 };
 type Storage = {
   save(run: OrchestrationRun): Promise<void>;
@@ -149,8 +241,12 @@ export function scopesOverlap(a: string[], b: string[]): boolean {
     });
   });
 }
+/** A live worker process: it holds a worker slot as well as its scope. */
 const activeTask = (task: OrchestrationTask) =>
   task.status === "running" || task.status === "cancelling";
+/** A settled result the lead has not been woken with yet. */
+const deliverable = (task: OrchestrationTask) =>
+  !task.delivered && !busyTask(task) && task.status !== "queued";
 export const sameCheckout = (a: string, b: string) =>
   pathKey(a.replace(/\\/g, "/")) === pathKey(b.replace(/\\/g, "/"));
 const messageOf = (error: unknown) =>
@@ -159,24 +255,157 @@ const messageOf = (error: unknown) =>
 const recoveryTurn = (reason: string) =>
   `Continue the existing assignment from its retained worker checkout. The previous turn was stopped because the orchestration run was interrupted: ${reason}\n\nInspect the current files and prior conversation before acting. Preserve completed work, do not repeat destructive or external operations, remain inside the assigned write scope, run the remaining focused checks, and report what was already done versus what you completed now.`;
 
+/** Output of each failing check quoted back to the worker. */
+const FIX_OUTPUT_CHARS = 3000;
+/** Patch bytes a reviewer prompt may carry, split across the reviewed tasks. */
+export const REVIEW_PATCH_BYTES = 120_000;
+
+/** Follow-up turn asking a worker to fix the checks that failed in its checkout. */
+export function checkFixTurn(
+  failed: CheckResult[],
+  attempt: number,
+  maxAttempts: number,
+): string {
+  const details = failed
+    .map((check) => {
+      const how = check.timedOut
+        ? "timed out"
+        : `exited with ${check.exitCode ?? "no exit code"}`;
+      const tail = check.outputTail.slice(-FIX_OUTPUT_CHARS).trim();
+      return `\`${check.command}\` ${how}.${tail ? `\nEnd of its output:\n\`\`\`\n${tail}\n\`\`\`` : ""}`;
+    })
+    .join("\n\n");
+  return `MonoCode ran your assignment's acceptance checks in your checkout after your last turn, and ${failed.length === 1 ? "one failed" : `${failed.length} failed`}. This is automatic fix attempt ${attempt} of ${maxAttempts}.\n\n${details}\n\nFix the cause within your assigned write scope, then rerun the failing commands yourself. Do not weaken, skip or delete tests or checks to make them pass. If the failure comes from outside your scope or cannot be fixed by you, stop and report "blocked" with the reason. MonoCode reruns every check after this turn.`;
+}
+
+/** A check run that stopped before finishing; Resume starts it again. */
+const checksInterrupted = (
+  task: OrchestrationTask,
+  reason: string,
+): OrchestrationTask => ({
+  ...task,
+  status: "interrupted",
+  recheck: true,
+  checkRunId: undefined,
+  accepted: false,
+  delivered: true,
+  error: `Acceptance checks were interrupted (${reason}). Resume runs them again.`,
+});
+
+/** Fold the turn its active dispatch ran into the task's time totals. */
+function turnEnded(
+  run: OrchestrationRun,
+  task: OrchestrationTask,
+  now = Date.now(),
+): Partial<OrchestrationTask> {
+  const dispatch = run.dispatches?.find(
+    (entry) => entry.id === task.activeDispatchId,
+  );
+  if (!dispatch) return {};
+  return {
+    activeMs: (task.activeMs ?? 0) + Math.max(0, now - dispatch.startedAt),
+    finishedAt: now,
+  };
+}
+
+/**
+ * Tokens the worker's latest turn reported, once per transcript turn. Absent
+ * when the provider reported none, or the turn was already counted.
+ */
+function turnTokens(
+  session: Session | undefined,
+  task: OrchestrationTask,
+): Pick<OrchestrationTask, "tokens" | "usageBlockId"> {
+  const blocks = session?.blocks ?? [];
+  let turn: Session["blocks"][number] | undefined;
+  for (let index = blocks.length - 1; index >= 0; index -= 1)
+    if (blocks[index].role === "user") {
+      turn = blocks[index];
+      break;
+    }
+  const metrics = turn?.turnMetrics;
+  if (
+    !turn ||
+    turn.id === task.usageBlockId ||
+    !metrics ||
+    (metrics.inputTokens == null && metrics.outputTokens == null)
+  )
+    return {};
+  return {
+    tokens: {
+      input: (task.tokens?.input ?? 0) + (metrics.inputTokens ?? 0),
+      output: (task.tokens?.output ?? 0) + (metrics.outputTokens ?? 0),
+    },
+    usageBlockId: turn.id,
+  };
+}
+
+const budgetPause = (detail: string) =>
+  `Run budget reached: ${detail}. Its agents were stopped; raise the budget or Resume to continue.`;
+
+/**
+ * Why the run's budget is spent, if it is. Turns only block a new dispatch:
+ * reaching the turn cap with every turn finished leaves the run usable.
+ */
+function budgetReason(
+  run: OrchestrationRun,
+  dispatching: boolean,
+  now = Date.now(),
+): string | undefined {
+  if (!run.budget) return undefined;
+  const usage = orchestrationUsage(run, now);
+  const base = run.budgetBaseline ?? { elapsedMs: 0, workerTurns: 0 };
+  const minutes = (usage.elapsedMs - base.elapsedMs) / 60_000;
+  if (run.budget.maxMinutes && minutes >= run.budget.maxMinutes)
+    return `${Math.floor(minutes)} of ${run.budget.maxMinutes} minutes used`;
+  const turns = usage.workerTurns - base.workerTurns;
+  if (
+    dispatching &&
+    run.budget.maxWorkerTurns &&
+    turns >= run.budget.maxWorkerTurns
+  )
+    return `${turns} of ${run.budget.maxWorkerTurns} worker turns used`;
+  return undefined;
+}
+
 const ASSIGNMENT_BLOCK =
   /(?:\r?\n[ \t]*)*<monocode_assignment\b[^>]*>[\s\S]*?<\/monocode_assignment>/gi;
+const BRIEF_BLOCK =
+  /^\s*<monocode_brief\b[^>]*>[\s\S]*?<\/monocode_brief>(?:[ \t]*\r?\n)*/i;
 
-/** Prompt the worker receives, including the envelope the transcript hides. */
+const RESULT_FORMAT =
+  '{"status":"done"|"partial"|"blocked","summary":"what you did and its outcome","changedFiles":["project-relative paths you changed"],"checks":[{"command":"exact command","passed":true,"note":"optional"}],"blockers":["what stops you, if anything"],"followUps":["optional suggestions for the lead"]}';
+
+/**
+ * Prompt the worker receives, including the envelope the transcript hides.
+ * The run brief comes first and is identical for every worker of a run, so a
+ * provider's prompt cache can reuse it across workers.
+ */
 export function workerTurnPrompt(
   prompt: string,
   files: string[],
   scratchDir?: string,
+  brief?: string,
 ): string {
   const scratch = scratchDir
     ? ` Temporary helpers and test output may be written in your private scratch directory: ${JSON.stringify(scratchDir)}. TMPDIR, TMP and TEMP point there. Use this directory for scratch files; do not write elsewhere outside the project. Deliver final changes in your assigned project files.`
     : "";
-  return `${prompt}\n\n<monocode_assignment>\nYou are a worker managed by a MonoCode lead. Work only in the checkout selected for this run. The workspace, scope and Git rules in this assignment envelope override any contradictory wording in the task text above. Your assigned write scope is: ${files.join(", ")}.${scratch} Read other files as needed, but do not edit outside your scope. If another file or shared operation is needed, report the blocker and stop so the lead can expand or create a new assignment. Do not spawn agents, create worktrees, switch branches, stage, commit, push, install dependencies or run broad formatters/generators. A task owning '.' may run explicitly requested project-wide validation or generation, but Git finalization remains the lead's responsibility after integration. Other workers may be working concurrently in separate checkouts; do not rely on their work until the lead has accepted it. Report focused checks, changed files, remaining issues and a concise final result.\n</monocode_assignment>`;
+  const shared = brief?.trim()
+    ? `<monocode_brief>\nShared notes from the lead's investigation of this project. Rely on them instead of re-exploring; your task text and assignment take precedence.\n\n${brief.trim()}\n</monocode_brief>\n\n`
+    : "";
+  // A reviewer owns no files: any project write stops it.
+  const scope = files.length
+    ? `Your assigned write scope is: ${files.join(", ")}.`
+    : "You are a read-only reviewer with no write scope: never edit, create or delete project files, and avoid commands that write to the project. A project write stops this review.";
+  return `${shared}${prompt}\n\n<monocode_assignment>\nYou are a worker managed by a MonoCode lead. Work only in the checkout selected for this run. The workspace, scope and Git rules in this assignment envelope override any contradictory wording in the task text above. ${scope}${scratch} Read other files as needed, but do not edit outside your scope. If another file or shared operation is needed, report the blocker and stop so the lead can expand or create a new assignment. Do not spawn agents, create worktrees, switch branches, stage, commit, push, install dependencies or run broad formatters/generators. A task owning '.' may run explicitly requested project-wide validation or generation, but Git finalization remains the lead's responsibility after integration. Other workers may be working concurrently in separate checkouts; do not rely on their work until the lead has accepted it. Run focused checks for your change. End your final message with exactly one <monocode_result> block holding this JSON, and nothing after it: <monocode_result>${RESULT_FORMAT}</monocode_result>. Use "done" only when the assignment is complete and its checks pass, "partial" when some of it remains, and "blocked" when you stopped on something the lead must resolve.\n</monocode_assignment>`;
 }
 
-/** Task text a person should see: the assignment envelope stays in the send. */
+/**
+ * Task text a person should see: the run brief and the assignment envelope
+ * stay in the send.
+ */
 export function visibleUserPrompt(text: string): string {
-  return text.replace(ASSIGNMENT_BLOCK, "").trimEnd();
+  return text.replace(BRIEF_BLOCK, "").replace(ASSIGNMENT_BLOCK, "").trimEnd();
 }
 
 function text(value: unknown, label: string, max = 30_000): string {
@@ -199,18 +428,34 @@ function strings(value: unknown, label: string, max = 64): string[] {
  */
 const FIELDS = new Map<string, string[]>([
   ["list", []],
-  ["delegate", ["title", "harness", "model", "prompt", "files", "dependsOn"]],
+  [
+    "delegate",
+    [
+      "title",
+      "harness",
+      "model",
+      "prompt",
+      "files",
+      "dependsOn",
+      "checks",
+      "kind",
+      "reviewOf",
+    ],
+  ],
   ["get", ["taskId"]],
   ["message", ["taskId", "text"]],
   ["retry", ["taskId", "text", "files"]],
   ["cancel", ["taskId"]],
   ["wait", ["timeoutSeconds"]],
   ["review", ["taskId"]],
+  ["diff", ["taskId", "maxBytes"]],
   ["finish", []],
   ["steer", ["taskId", "text"]],
   ["respond", ["taskId", "requestId", "decision"]],
   ["answer", ["taskId", "requestId", "answers", "skip"]],
 ]);
+/** Inspection stays available on an inactive run and is never receipted. */
+const READ_ONLY_ACTIONS = new Set(["list", "get", "diff"]);
 function checkFields(action: string, input: Record<string, unknown>) {
   const allowed = FIELDS.get(action);
   if (!allowed)
@@ -265,10 +510,54 @@ function questionAnswers(
     throw new Error('Answer at least one question, or pass {"skip":true}');
   return answers;
 }
+function diffBytes(value: unknown): number {
+  if (value == null) return DIFF_BYTES.default;
+  if (typeof value !== "number" || !Number.isFinite(value))
+    throw new Error(
+      `maxBytes must be a number of bytes from ${DIFF_BYTES.min} to ${DIFF_BYTES.max}; omit it for ${DIFF_BYTES.default}.`,
+    );
+  return Math.min(DIFF_BYTES.max, Math.max(DIFF_BYTES.min, Math.round(value)));
+}
 const listed = (values: string[], max = 12) =>
   values.length > max
     ? `${values.slice(0, max).join(", ")} (+${values.length - max} more)`
     : values.join(", ");
+
+/** Failing check output per check in list and wait; get keeps the full tail. */
+const LIST_CHECK_OUTPUT = 1000;
+
+/** A new instruction from the lead restarts check accounting. */
+const FRESH_CHECKS = {
+  checkResults: undefined,
+  checkRetries: undefined,
+  checkRunId: undefined,
+  recheck: undefined,
+  autoAccepted: undefined,
+  autoAcceptError: undefined,
+} satisfies Partial<OrchestrationTask>;
+
+/** Bookkeeping the lead never acts on. */
+const internalFieldsHidden = (task: OrchestrationTask) => ({
+  ...task,
+  checkRunId: undefined,
+  recheck: undefined,
+  usageBlockId: undefined,
+});
+
+/** Review tasks that read `task`, with their verdicts once complete. */
+function reviewsOf(run: OrchestrationRun, task: OrchestrationTask) {
+  const reviews = run.tasks
+    .filter(
+      (entry) => entry.kind === "review" && entry.reviewOf?.includes(task.id),
+    )
+    .map((entry) => ({
+      taskId: entry.id,
+      title: entry.title,
+      status: entry.status,
+      verdict: reviewVerdict(entry),
+    }));
+  return reviews.length ? reviews : undefined;
+}
 
 export class Orchestrator {
   private runs: OrchestrationRun[] = [];
@@ -282,6 +571,13 @@ export class Orchestrator {
   private starting = new Set<string>();
   private pumpAgain = false;
   private waking = new Set<string>();
+  /** One pending lead wake-up per run, with the time it is due. */
+  private wakeTimers = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; due: number }
+  >();
+  /** When the oldest undelivered event of a run was first seen. */
+  private pendingSince = new Map<string, number>();
   private blocked = new Map<string, string>();
   private announced = new Map<string, Set<string>>();
   /** Async write checks are isolated per dispatch, including retries. */
@@ -359,8 +655,13 @@ export class Orchestrator {
               ...entry,
               status: "paused",
               error: `Could not save run: ${messageOf(error)}`,
+              ...settleActiveTime(entry),
               tasks: entry.tasks.map((task) =>
-                activeTask(task) ? { ...task, status: "cancelling" } : task,
+                activeTask(task)
+                  ? { ...task, status: "cancelling" }
+                  : task.status === "checking"
+                    ? checksInterrupted(task, "run history could not be saved")
+                    : task,
               ),
             }
           : entry,
@@ -512,11 +813,24 @@ export class Orchestrator {
           .map((task) => task.activeDispatchId)
           .filter((dispatchId): dispatchId is string => !!dispatchId),
       );
+      // The app was closed for an unknown time; count active time only up to
+      // the last recorded activity.
+      const lastActivity = Math.max(
+        run.activeSince ?? 0,
+        ...(run.dispatches ?? []).map((dispatch) => dispatch.updatedAt),
+        ...run.tasks.map((task) => task.finishedAt ?? 0),
+      );
       await this.commit({
         ...run,
         status: run.status === "active" ? "paused" : run.status,
+        activeMs:
+          (run.activeMs ?? 0) +
+          (run.activeSince ? Math.max(0, lastActivity - run.activeSince) : 0),
+        activeSince: undefined,
         tasks: run.tasks.map((task) =>
-          activeTask(task)
+          task.status === "checking"
+            ? checksInterrupted(task, "MonoCode stopped while they ran")
+            : activeTask(task)
             ? {
                 ...task,
                 status: "interrupted",
@@ -559,38 +873,58 @@ export class Orchestrator {
       throw error;
     }
   }
+  /**
+   * `limits` overrides apply to a new run; a resumed run keeps the limits it
+   * was started with unless overrides are passed again.
+   */
   async start(
     leadId: string,
     allowedHarnesses: HarnessId[],
     maxWorkers: number,
-    approved?: {
-      proposalId: string;
-      allowedModels: OrchestrationChoice[];
-      tasks: OrchestrationTask[];
-    },
+    approved?: ApprovedStart,
+    limits?: Partial<OrchestrationLimits>,
+    options?: OrchestrationRunOptions,
   ) {
     if (this.starting.has(leadId))
       throw new Error("The run is already starting");
     this.starting.add(leadId);
     try {
-      await this.startRun(leadId, allowedHarnesses, maxWorkers, approved);
+      await this.startRun(
+        leadId,
+        allowedHarnesses,
+        maxWorkers,
+        approved,
+        limits,
+        options,
+      );
     } finally {
       this.starting.delete(leadId);
     }
   }
+  /**
+   * `options.autoAccept` overrides the card's setting; `options.budget` caps
+   * the run's time and worker turns.
+   */
   async startApproved(
     leadId: string,
     proposalId: string,
     proposal: OrchestrationProposal,
+    overrides?: Partial<OrchestrationLimits>,
+    options?: OrchestrationRunOptions,
   ) {
     if (proposal.status !== "ready")
       throw new Error("Review a completed proposal before starting");
-    const settings = validateOrchestrationSettings(proposal.settings);
+    const limits = resolveOrchestrationLimits(overrides);
+    const settings = validateOrchestrationSettings(proposal.settings, limits);
+    const budget = validateOrchestrationBudget(options?.budget);
+    const autoAccept = options?.autoAccept ?? settings.autoAccept ?? false;
     const planned = validateProposedTasks(
       proposal.tasks,
       settings,
       proposal.checkoutCwd ?? proposal.cwd,
+      limits,
     );
+    const brief = validateOrchestrationBrief(proposal.brief);
     const lead = this.host?.session(leadId);
     if (
       !lead ||
@@ -628,11 +962,13 @@ export class Orchestrator {
         id: ids.get(task.id)!,
         assignmentId: task.id,
         sessionId: crypto.randomUUID(),
-        scopes: await this.store.scopes(
-          lead.worktreeCwd ?? lead.cwd,
-          task.files,
-        ),
+        scopes: task.files.length
+          ? await this.store.scopes(lead.worktreeCwd ?? lead.cwd, task.files)
+          : [],
         dependsOn: task.dependsOn.map((id) => ids.get(id)!),
+        ...(task.reviewOf
+          ? { reviewOf: task.reviewOf.map((id) => ids.get(id)!) }
+          : {}),
         status: "queued",
         accepted: false,
         delivered: true,
@@ -653,11 +989,13 @@ export class Orchestrator {
       leadId,
       [...new Set(allowedModels.map((choice) => choice.harness))],
       settings.maxWorkers,
-      { proposalId, allowedModels, tasks },
+      { proposalId, allowedModels, tasks, brief },
+      limits,
+      { autoAccept, budget },
     );
     this.host!.submit(
       leadId,
-      `The user confirmed the orchestration card, including any edits. The app has already queued the exact assignments below; do not delegate duplicates. Supervise them through the control CLI, review their changes, request corrections when needed, and finish the original request.\n\nOriginal request:\n${proposal.request}\n\nApproved assignments:\n${JSON.stringify(tasks.map(({ id, title, prompt, harness, model, modelSettings, files, dependsOn }) => ({ taskId: id, title, prompt, harness, model, modelSettings, files, dependsOn })))}`,
+      `The user confirmed the orchestration card, including any edits. The app has already queued the exact assignments below; do not delegate duplicates. Supervise them through the control CLI, review their changes, request corrections when needed, and finish the original request.\n\nOriginal request:\n${proposal.request}\n\nApproved assignments:\n${JSON.stringify(tasks.map(({ id, title, prompt, harness, model, modelSettings, files, dependsOn, kind, reviewOf, checks }) => ({ taskId: id, title, prompt, harness, model, modelSettings, files, dependsOn, kind, reviewOf, checks })))}`,
       (outcome) => {
         if (outcome.status !== "completed")
           void this.pause(
@@ -672,14 +1010,13 @@ export class Orchestrator {
     leadId: string,
     allowedHarnesses: HarnessId[],
     maxWorkers: number,
-    approved?: {
-      proposalId: string;
-      allowedModels: OrchestrationChoice[];
-      tasks: OrchestrationTask[];
-    },
+    approved?: ApprovedStart,
+    overrides?: Partial<OrchestrationLimits>,
+    options?: OrchestrationRunOptions,
   ) {
     const lead = this.host?.session(leadId);
     if (!lead) throw new Error("The orchestration lead is unavailable");
+    const requestedBudget = validateOrchestrationBudget(options?.budget);
     if (lead.busy)
       throw new Error(
         this.run(leadId)?.status === "paused"
@@ -691,21 +1028,30 @@ export class Orchestrator {
       lead.worktreeCwd ?? lead.cwd,
       lead.branch,
     );
-    if (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 4)
-      throw new Error("Choose 1 to 4 workers");
+    const previous = this.run(leadId);
+    const resumable = previous?.status === "paused" ? previous : undefined;
+    const limits = resolveOrchestrationLimits({
+      ...resumable?.limits,
+      ...overrides,
+    });
+    if (
+      !Number.isInteger(maxWorkers) ||
+      maxWorkers < 1 ||
+      maxWorkers > limits.maxWorkers
+    )
+      throw new Error(`Choose 1 to ${limits.maxWorkers} workers`);
     const available = this.host!.choices().map((choice) => choice.harness);
     if (
       !allowedHarnesses.length ||
       allowedHarnesses.some((id) => !available.includes(id))
     )
       throw new Error("Choose installed worker harnesses");
-    const previous = this.run(leadId);
     if (
       previous?.status === "active" ||
       (approved && previous?.status === "paused")
     )
       throw new Error("Stop the current run before starting another proposal");
-    if (previous?.tasks.some(activeTask))
+    if (previous?.tasks.some(busyTask))
       throw new Error(
         previous.status === "paused"
           ? "Wait for interrupted agents to stop before resuming orchestration"
@@ -735,8 +1081,18 @@ export class Orchestrator {
     const cli = await this.store.enable(leadId, workspace.checkoutCwd);
     const resumedTasks =
       previous?.status === "paused"
-        ? previous.tasks.map((task) =>
-            task.status === "interrupted"
+        ? previous.tasks.map((task): OrchestrationTask =>
+            task.status === "interrupted" && task.recheck
+              ? {
+                  ...task,
+                  status: "checking",
+                  checkRunId: crypto.randomUUID(),
+                  recheck: undefined,
+                  error: undefined,
+                  delivered: true,
+                  accepted: false,
+                }
+              : task.status === "interrupted"
               ? {
                   ...task,
                   status: "queued" as const,
@@ -755,9 +1111,32 @@ export class Orchestrator {
               : task,
           )
         : [];
+    const budget = requestedBudget ?? (approved ? undefined : resumable?.budget);
+    // Resuming a run whose budget ran out grants the same allowance again,
+    // counted from now; a raised budget that still has room keeps counting.
+    const spent =
+      resumable &&
+      budget &&
+      budgetReason({ ...resumable, budget }, true) !== undefined;
+    const usage = resumable && orchestrationUsage(resumable);
+    const rechecks = resumedTasks.filter(
+      (task) => task.status === "checking" && task.checkRunId,
+    );
     try {
       await this.host!.stop(leadId); // Refresh the child environment before its next turn.
       await this.commit({
+        autoAccept:
+          options?.autoAccept ??
+          (approved ? false : (resumable?.autoAccept ?? false)),
+        budget,
+        budgetBaseline:
+          spent && usage
+            ? { elapsedMs: usage.elapsedMs, workerTurns: usage.workerTurns }
+            : approved
+              ? undefined
+              : resumable?.budgetBaseline,
+        activeMs: approved ? 0 : (resumable?.activeMs ?? 0),
+        activeSince: Date.now(),
         version: 2,
         leadId,
         cwd: lead.cwd,
@@ -772,7 +1151,9 @@ export class Orchestrator {
         proposalId:
           approved?.proposalId ??
           (previous?.status === "paused" ? previous.proposalId : undefined),
+        brief: approved ? approved.brief : resumable?.brief,
         maxWorkers,
+        limits,
         tasks:
           approved?.tasks ??
           (previous?.status === "paused" ? resumedTasks : []),
@@ -789,6 +1170,10 @@ export class Orchestrator {
       await this.store.disable(leadId);
       throw error;
     }
+    for (const task of rechecks)
+      void this.runChecks(leadId, task.id, task.checkRunId!).catch(
+        console.error,
+      );
     void this.pump();
     this.sync();
   }
@@ -800,12 +1185,12 @@ export class Orchestrator {
     if (
       own &&
       own.leadId !== id &&
-      (own.status === "active" || own.tasks.some(activeTask))
+      (own.status === "active" || own.tasks.some(busyTask))
     )
       return "This worker is managed by the orchestrator. Send instructions through its lead or stop the run first.";
     const other = this.runs.find(
       (run) =>
-        (run.status === "active" || run.tasks.some(activeTask)) &&
+        (run.status === "active" || run.tasks.some(busyTask)) &&
         run.leadId !== id &&
         sameCheckout(
           orchestrationCheckoutCwd(run),
@@ -830,7 +1215,23 @@ export class Orchestrator {
     const run = this.run(id);
     if (!run || run.status !== "active") return prompt;
     const cli = `${shellPath(run.cli)} control`;
-    return `${prompt}\n\n<monocode_orchestration>\nYou are the lead of a local MonoCode run. Coordinate the user's task using ${cli}. Run \`${cli} --help\` before your first command; it documents every action, its exact JSON fields and the retry rule. Credentials are already in your environment; never print them.\nEach call prints one JSON line and exits non-zero unless "ok" is true; read the "error" text, it says what to do next. Unknown JSON fields are rejected rather than ignored, so fix the field name instead of guessing. If a call fails before reaching MonoCode, retry it with the "requestId" from that response so the work is never queued twice.\nUse list to discover allowed harness/model IDs. Delegate bounded tasks with project-relative files (directories reserve their descendants), self-contained prompts and dependsOn task IDs. Use the checkout selected for this run. You may read and plan; leave project file edits to workers. Never start workers outside this CLI. Workers with overlapping files are queued. For project-wide validation, generators or broad formatting, assign a separate task with files ["."] and wait for other workers to finish. Workers must never commit, push, switch branches or write outside the selected checkout. If the user requested those final operations, review and integrate every worker, call finish, then perform the explicitly authorized finalization yourself from the lead checkout.\nAgents never prompt the user. When one needs an approval or answers a question, list, get and wait report it as needsInput on that task, and you decide with respond or answer; it stays stopped until you do. Judge the request against the task you assigned, and put it to the user in this conversation only when the call is genuinely theirs.\nSteer a running agent with steer to correct its course without losing its work; use message only once it has stopped. Read results with get or wait; completed means a turn finished, not that the work passed review. Review the actual changes, message a worker for fixes, and use review to accept each completed task. A scope-blocked worker is isolated to that task: use message if it should stay within its existing scope, retry with corrected project-relative files if the assignment was too narrow, or cancel it if no longer needed. Never expand scope merely to excuse an unexpected write. Call finish only when required work and combined validation are complete. You receive worker results automatically when idle; use bounded wait calls while supervising. If the run is paused, list/get/wait remain readable and explain the reason. Stop polling, report that reason, and ask the user to click Resume; Resume automatically continues interrupted workers from their retained checkouts. Do not expose credentials, create worktrees, switch branches or silently escalate worker permissions.\n</monocode_orchestration>`;
+    return `${prompt}\n\n<monocode_orchestration>\nYou are the lead of a local MonoCode run. Coordinate the user's task using ${cli}. Run \`${cli} --help\` before your first command; it documents every action, its exact JSON fields and the retry rule. Credentials are already in your environment; never print them.\nEach call prints one JSON line and exits non-zero unless "ok" is true; read the "error" text, it says what to do next. Unknown JSON fields are rejected rather than ignored, so fix the field name instead of guessing. If a call fails before reaching MonoCode, retry it with the "requestId" from that response so the work is never queued twice.\nUse list to discover allowed harness/model IDs. Delegate bounded tasks with project-relative files (directories reserve their descendants), self-contained prompts and dependsOn task IDs. Use the checkout selected for this run. You may read and plan; leave project file edits to workers. Never start workers outside this CLI. Workers with overlapping files are queued. For project-wide validation, generators or broad formatting, assign a separate task with files ["."] and wait for other workers to finish. Workers must never commit, push, switch branches or write outside the selected checkout. If the user requested those final operations, review and integrate every worker, call finish, then perform the explicitly authorized finalization yourself from the lead checkout.\nAgents never prompt the user. When one needs an approval or answers a question, list, get and wait report it as needsInput on that task, and you decide with respond or answer; it stays stopped until you do. Judge the request against the task you assigned, and put it to the user in this conversation only when the call is genuinely theirs.\nSupervision is event-driven: after delegating, end your turn instead of polling. MonoCode wakes you automatically, batching worker results together and bringing any approval or question that needs you. Use wait only when you genuinely need a result before you can continue the current turn, keep it bounded, and never loop on list, get or wait.
+Steer a running agent with steer to correct its course without losing its work; use message only once it has stopped. Each result is a compact report: status, summary, the files the worker actually changed, its checks and blockers; get shows one task in detail. Completed means a turn finished, not that the work passed review. Review with diff before review/accept: read the actual patch, message a worker for fixes, and use review to accept each completed task. A scope-blocked worker is isolated to that task: use message if it should stay within its existing scope, retry with corrected project-relative files if the assignment was too narrow, or cancel it if no longer needed. Never expand scope merely to excuse an unexpected write. Call finish only when required work and combined validation are complete. If the run is paused, list/get/diff/wait remain readable and explain the reason. Stop polling, report that reason, and ask the user to click Resume; Resume automatically continues interrupted workers from their retained checkouts. Do not expose credentials, create worktrees, switch branches or silently escalate worker permissions.\nGive a delegated task "checks" when a fast, focused command can verify it, such as one test file or a typecheck. MonoCode runs them in the worker's checkout after each turn (status checking) and sends failures back to the worker itself, so you are woken only once they pass or its automatic fixes run out; "App-run checks" in a result are MonoCode's own results, not the worker's claims. For an independent read-only review, delegate "kind":"review" with "reviewOf" taskIds and no files: it starts once those tasks complete, reads their patches, and its verdict arrives with their results (approved, or changes requested with blockers). Accepting a review task only records it; it never changes files.${
+      run.autoAccept
+        ? " This run auto-accepts: a completed task whose checks all passed and whose report is done is integrated without your review, and its result says so. Tasks without checks still wait for your review."
+        : ""
+    }${
+      run.budget
+        ? ` This run has a budget (${[
+            run.budget.maxMinutes ? `${run.budget.maxMinutes} minutes` : "",
+            run.budget.maxWorkerTurns
+              ? `${run.budget.maxWorkerTurns} worker turns`
+              : "",
+          ]
+            .filter(Boolean)
+            .join(", ")}); MonoCode pauses the run when it is spent, so delegate economically.`
+        : ""
+    }\n</monocode_orchestration>`;
   }
   async handle(
     leadId: string,
@@ -866,11 +1267,13 @@ export class Orchestrator {
         const run = this.run(leadId);
         if (!run)
           throw new Error("No orchestration run was found for this lead");
-        if (run.status !== "active" && !["list", "get"].includes(action))
+        const readOnly = READ_ONLY_ACTIONS.has(action);
+        if (run.status !== "active" && !readOnly)
           throw new Error(this.inactiveReason(run));
         if (
-          !["list", "get"].includes(action) &&
-          Object.keys(run.requests).length >= 512
+          !readOnly &&
+          Object.keys(run.requests).length >=
+            orchestrationLimits(run).maxCommands
         )
           throw new Error(
             "Run command limit reached. Stop the run and start another after reviewing the files.",
@@ -889,16 +1292,39 @@ export class Orchestrator {
       void this.pump();
     }
   }
+  /**
+   * The run as list and wait report it. Results are compact: a worker's report
+   * replaces its text, and dispatch history omits the text it already carries.
+   */
   private view(run: OrchestrationRun) {
+    const { leadResultChars } = orchestrationLimits(run);
     return {
       ...run,
       cli: undefined,
       requests: undefined,
+      brief: undefined,
+      budgetBaseline: undefined,
+      activeMs: undefined,
+      activeSince: undefined,
+      usage: orchestrationUsage(run),
       recovery: run.status === "active" ? undefined : this.inactiveReason(run),
+      dispatches: run.dispatches?.map((dispatch) => ({
+        ...dispatch,
+        result: undefined,
+      })),
       tasks: run.tasks.map((task) => ({
-        ...task,
+        ...internalFieldsHidden(task),
         prompt: undefined,
         scopes: undefined,
+        ...leadResultFields(task, leadResultChars),
+        // Passing output is noise in a list; get returns every tail.
+        checkResults: task.checkResults?.map((check) => ({
+          ...check,
+          outputTail: check.passed
+            ? undefined
+            : check.outputTail.slice(-LIST_CHECK_OUTPUT),
+        })),
+        reviews: reviewsOf(run, task),
         waitingFor: this.waitingFor(run, task),
         needsInput: this.pendingInput(task),
       })),
@@ -938,8 +1364,18 @@ export class Orchestrator {
       (entry) => task.dependsOn.includes(entry.id) && !entry.accepted,
     );
     if (dependency) return `Waiting for review: ${dependency.title}`;
+    const reviewed = run.tasks.find(
+      (entry) =>
+        task.reviewOf?.includes(entry.id) && entry.status !== "completed",
+    );
+    if (reviewed)
+      return ["queued", "running", "cancelling", "checking"].includes(
+        reviewed.status,
+      )
+        ? `Waiting for ${reviewed.title} to complete`
+        : `Cannot review ${reviewed.title}: it is ${reviewed.status}. Correct it with message or retry, or cancel this review.`;
     const owner = run.tasks.find(
-      (entry) => activeTask(entry) && scopesOverlap(entry.scopes, task.scopes),
+      (entry) => busyTask(entry) && scopesOverlap(entry.scopes, task.scopes),
     );
     if (owner) return `Waiting for files: ${owner.title}`;
     return "Waiting for a worker slot";
@@ -1009,7 +1445,9 @@ export class Orchestrator {
         // The fields list reports, plus this task's own prompt.
         const target = task();
         return {
-          ...target,
+          ...internalFieldsHidden(target),
+          ...leadResultFields(target, orchestrationLimits(run).leadResultChars),
+          reviews: reviewsOf(this.run(run.leadId)!, target),
           runStatus: run.status,
           recovery:
             run.status === "active" ? undefined : this.inactiveReason(run),
@@ -1019,8 +1457,11 @@ export class Orchestrator {
         };
       }
       case "delegate": {
-        if (run.tasks.length >= 40)
-          throw new Error("This run has reached its 40-task limit");
+        const { maxTasks } = orchestrationLimits(run);
+        if (run.tasks.length >= maxTasks)
+          throw new Error(
+            `This run has reached its ${maxTasks}-task limit. Reuse an existing task with message or retry, or finish this run and start another.`,
+          );
         const harness = text(input.harness, "harness") as HarnessId;
         if (
           !HARNESSES.includes(harness) ||
@@ -1049,14 +1490,57 @@ export class Orchestrator {
           throw new Error(
             `Choose a model ID returned by list for ${harness}: ${listed(permittedModels.map((item) => item.id)) || "none available"}.`,
           );
+        const kind = validateTaskKind(input.kind, "This task's");
         const title = text(input.title, "title", 160);
-        const prompt = text(input.prompt, "prompt");
-        const files = strings(input.files, "files");
-        if (!files.length)
-          throw new Error(
-            "Declare at least one file/directory scope in files, or '.' for exclusive checkout access",
-          );
-        const dependsOn = strings(input.dependsOn ?? [], "dependsOn", 40);
+        const prompt =
+          kind === "review" && input.prompt == null
+            ? "Review the changes of the listed tasks."
+            : text(input.prompt, "prompt");
+        const files = strings(
+          kind === "review" ? (input.files ?? []) : input.files,
+          "files",
+        );
+        const checks = validateTaskChecks(input.checks, "This task's");
+        const reviewOf =
+          input.reviewOf == null
+            ? []
+            : strings(input.reviewOf, "reviewOf", maxTasks);
+        if (kind === "review") {
+          if (files.length)
+            throw new Error(
+              'A review task has no write scope: omit files or pass []. To have changes made, delegate a "work" task instead.',
+            );
+          if (!reviewOf.length)
+            throw new Error(
+              "A review task needs reviewOf: the taskIds of the work it reviews, from delegate or list.",
+            );
+          if (checks)
+            throw new Error(
+              "A review task cannot have checks: they would run in its own unchanged checkout. Put checks on the work task it reviews.",
+            );
+          const invalid = reviewOf.filter((id) => {
+            const reviewed = run.tasks.find((item) => item.id === id);
+            return (
+              !reviewed ||
+              reviewed.kind === "review" ||
+              reviewed.status === "cancelled"
+            );
+          });
+          if (invalid.length)
+            throw new Error(
+              `reviewOf must hold work taskIds from this run; unknown, cancelled or review tasks: ${listed(invalid)}.`,
+            );
+        } else {
+          if (!files.length)
+            throw new Error(
+              "Declare at least one file/directory scope in files, or '.' for exclusive checkout access",
+            );
+          if (reviewOf.length)
+            throw new Error(
+              'reviewOf is only for review tasks. Pass "kind":"review" with no files, or drop reviewOf.',
+            );
+        }
+        const dependsOn = strings(input.dependsOn ?? [], "dependsOn", maxTasks);
         const missing = dependsOn.filter(
           (id) =>
             !run.tasks.some(
@@ -1067,10 +1551,11 @@ export class Orchestrator {
           throw new Error(
             `dependsOn must hold taskIds from this run; unknown or cancelled: ${listed(missing)}.`,
           );
-        const scopes = await this.store.scopes(
-          orchestrationCheckoutCwd(run),
-          files,
-        );
+        const scopes = files.length
+          ? await this.store.scopes(orchestrationCheckoutCwd(run), files)
+          : [];
+        // Reviewers also get a throwaway worktree: a write the harness does not
+        // report (a shell command) can never reach the lead checkout.
         const created: OrchestrationTask = {
           id: crypto.randomUUID(),
           sessionId: crypto.randomUUID(),
@@ -1086,6 +1571,8 @@ export class Orchestrator {
           result: "",
           delivered: true,
           workspacePolicy: "isolated-child",
+          ...(kind === "review" ? { kind, reviewOf } : {}),
+          ...(checks ? { checks } : {}),
         };
         return record(
           {
@@ -1101,7 +1588,7 @@ export class Orchestrator {
       }
       case "message": {
         const target = task();
-        if (activeTask(target) || target.status === "queued")
+        if (busyTask(target) || target.status === "queued")
           throw new Error(
             `Wait for this worker or cancel it before sending a new turn; ${target.title} is ${target.status}.`,
           );
@@ -1123,18 +1610,21 @@ export class Orchestrator {
             status: "queued",
             accepted: false,
             result: "",
+            report: undefined,
+            changes: undefined,
             error: undefined,
             recoveryPrompt: undefined,
             delivered: true,
             activeDispatchId: undefined,
             acceptedDispatchId: undefined,
+            ...FRESH_CHECKS,
           },
           { taskId: target.id, status: "queued" },
         );
       }
       case "retry": {
         const target = task();
-        if (activeTask(target) || target.status === "queued")
+        if (busyTask(target) || target.status === "queued")
           throw new Error(
             `Wait for this worker or cancel it before retrying; ${target.title} is ${target.status}.`,
           );
@@ -1148,6 +1638,10 @@ export class Orchestrator {
         )
           throw new Error(
             "A dependent task has already started; create a separate correction task after it finishes",
+          );
+        if (target.kind === "review")
+          throw new Error(
+            "A review task has no write scope to correct. Send it a new turn with message, or cancel it.",
           );
         const files = strings(input.files, "files");
         if (!files.length)
@@ -1169,11 +1663,14 @@ export class Orchestrator {
             status: "queued",
             accepted: false,
             result: "",
+            report: undefined,
+            changes: undefined,
             error: undefined,
             recoveryPrompt: undefined,
             delivered: true,
             activeDispatchId: undefined,
             acceptedDispatchId: undefined,
+            ...FRESH_CHECKS,
           },
           { taskId: target.id, status: "queued", files },
         );
@@ -1247,96 +1744,54 @@ export class Orchestrator {
         });
       }
       case "review": {
-        let target = task();
+        const target = task();
         if (target.status !== "completed")
           throw new Error(
             `Only a completed result can be accepted; ${target.title} is ${target.status}. ${
               ["failed", "blocked", "interrupted"].includes(target.status)
                 ? "Send it another turn with message, retry it with corrected scope when necessary, or drop it with cancel."
-                : "Wait for it to finish, or cancel it."
+                : target.status === "checking"
+                  ? "MonoCode is running its acceptance checks; end your turn and you are woken with the result."
+                  : "Wait for it to finish, or cancel it."
             }`,
           );
-        const dispatchId = target.lastDispatchId;
-        if (!dispatchId)
-          throw new Error("This task has no completed dispatch to review");
-        const isolated = target.workspacePolicy !== "shared";
-        if (!target.accepted) {
-          if (isolated) {
-            if (!target.workspace)
-              throw new Error(
-                "This worker's isolated checkout is unavailable. Its changes were not accepted.",
-              );
-            await this.patchDispatch(run.leadId, dispatchId, {
-              stage: "integration_started",
-              cleanupError: undefined,
-            });
-            await this.host!.integrateWorker(this.run(run.leadId)!, target);
-          }
-          const current = this.run(run.leadId)!;
-          await this.commit({
-            ...current,
-            tasks: current.tasks.map((entry) =>
-              entry.id === target.id
-                ? {
-                    ...entry,
-                    accepted: true,
-                    acceptedDispatchId: dispatchId,
-                  }
-                : entry,
-            ),
-            dispatches: (current.dispatches ?? []).map((dispatch) =>
-              dispatch.id === dispatchId
-                ? {
-                    ...dispatch,
-                    stage: isolated ? "integrated" : dispatch.stage,
-                    updatedAt: Date.now(),
-                  }
-                : dispatch,
-            ),
-          });
-          target = this.run(run.leadId)!.tasks.find(
-            (entry) => entry.id === target.id,
-          )!;
+        const accepted = await this.acceptTask(run.leadId, target.id);
+        return record(this.run(run.leadId)!, { accepted: true, ...accepted });
+      }
+      case "diff": {
+        const target = task();
+        const maxBytes = diffBytes(input.maxBytes);
+        const started = !!(target.activeDispatchId ?? target.lastDispatchId);
+        if (!started)
+          throw new Error(
+            `${target.title} has not started yet, so it has no changes to diff. End your turn; MonoCode wakes you with its result.`,
+          );
+        if (target.workspacePolicy !== "shared" && !target.workspace)
+          throw new Error(
+            activeTask(target)
+              ? `${target.title}'s checkout is still being prepared. Try diff again once it is running.`
+              : target.accepted
+                ? `${target.title} was already accepted and its worktree cleaned up, so its changes are now in the lead checkout. Inspect them there with git diff.`
+                : `${target.title}'s isolated checkout is no longer available, so there is no worker diff to read. Use get for its report, or retry the task if its changes are still needed.`,
+          );
+        let diff: WorkerDiff;
+        try {
+          diff = await this.host!.workerDiff(
+            this.run(run.leadId)!,
+            target,
+            maxBytes,
+          );
+        } catch (error) {
+          throw new Error(
+            `Could not read ${target.title}'s changes: ${messageOf(error)}. Retry diff once its turn has settled, or use get for the files it reported.`,
+          );
         }
-
-        let cleaned = !isolated;
-        let cleanupError: string | undefined;
-        if (isolated) {
-          try {
-            cleaned = await this.host!.cleanupWorker(
-              this.run(run.leadId)!,
-              target,
-              false,
-            );
-          } catch (error) {
-            cleanupError = messageOf(error);
-          }
-          const current = this.run(run.leadId)!;
-          await this.commit({
-            ...current,
-            tasks: current.tasks.map((entry) =>
-              entry.id === target.id && cleaned
-                ? { ...entry, workspace: undefined }
-                : entry,
-            ),
-            dispatches: (current.dispatches ?? []).map((dispatch) =>
-              dispatch.id === dispatchId
-                ? {
-                    ...dispatch,
-                    ...(cleaned ? { stage: "cleaned" as const } : {}),
-                    cleanupError,
-                    updatedAt: Date.now(),
-                  }
-                : dispatch,
-            ),
-          });
-        }
-        return record(this.run(run.leadId)!, {
-          accepted: true,
-          integrated: isolated,
-          cleaned,
-          ...(cleanupError ? { cleanupError } : {}),
-        });
+        return {
+          taskId: target.id,
+          files: diff.files,
+          patch: diff.patch,
+          truncated: diff.truncated,
+        };
       }
       case "finish": {
         const outstanding = this.run(run.leadId)!.tasks.filter(
@@ -1352,7 +1807,9 @@ export class Orchestrator {
         for (const retained of this.run(run.leadId)!.tasks.filter(
           (entry) => entry.workspacePolicy !== "shared" && entry.workspace,
         )) {
-          if (!retained.accepted) {
+          // A reviewer's checkout is never applied to the lead checkout, even
+          // once accepted: only an unchanged one is removed.
+          if (!retained.accepted || retained.kind === "review") {
             const cleaned = await this.cleanupUnchangedWorker(
               run.leadId,
               retained.id,
@@ -1400,8 +1857,9 @@ export class Orchestrator {
               });
           }
         }
+        const finished = this.run(run.leadId)!;
         const result = await record(
-          { ...this.run(run.leadId)!, status: "finished" },
+          { ...finished, status: "finished", ...settleActiveTime(finished) },
           {
             finished: true,
             ...(cleanupPending.length ? { cleanupPending } : {}),
@@ -1433,7 +1891,7 @@ export class Orchestrator {
     if (
       run.status === "active" &&
       this.blockedKeys(run).length === 0 &&
-      (run.tasks.some(activeTask) ||
+      (run.tasks.some(busyTask) ||
         run.tasks.some((task) => task.status === "queued"))
     ) {
       await new Promise<void>((resolve) => {
@@ -1476,18 +1934,30 @@ export class Orchestrator {
             task.status !== "queued" ||
             task.dependsOn.some(
               (id) => !run.tasks.find((entry) => entry.id === id)?.accepted,
+            ) ||
+            // A review reads completed work; it never waits for acceptance.
+            task.reviewOf?.some(
+              (id) =>
+                run.tasks.find((entry) => entry.id === id)?.status !==
+                "completed",
             )
           )
             continue;
+          // Checking tasks keep their scope although their worker is idle.
           if (
             run.tasks.some(
               (entry) =>
-                activeTask(entry) && scopesOverlap(entry.scopes, task.scopes),
+                busyTask(entry) && scopesOverlap(entry.scopes, task.scopes),
             )
           )
             continue;
           if (!this.host.session(run.leadId)) {
             await this.stopRun(run.leadId);
+            break;
+          }
+          const spent = budgetReason(run, true);
+          if (spent) {
+            await this.pause(run.leadId, budgetPause(spent));
             break;
           }
           const dispatchId = crypto.randomUUID();
@@ -1546,10 +2016,12 @@ export class Orchestrator {
             )
               continue;
             const preparedRun = this.run(run.leadId)!;
-            const writeScopes = await this.store.scopes(
-              prepared.workspace.checkoutCwd,
-              task.files,
-            );
+            const writeScopes = task.files.length
+              ? await this.store.scopes(
+                  prepared.workspace.checkoutCwd,
+                  task.files,
+                )
+              : [];
             await this.commit({
               ...preparedRun,
               tasks: preparedRun.tasks.map((entry) =>
@@ -1579,24 +2051,58 @@ export class Orchestrator {
                 ?.status !== "running"
             )
               continue;
+            // A reviewer's first turn carries the reviewed patches, read now
+            // so they reflect each task's latest completed turn.
+            const body =
+              task.recoveryPrompt ??
+              (task.kind === "review"
+                ? await this.reviewPrompt(run.leadId, task.id)
+                : task.prompt);
+            if (
+              this.run(run.leadId)?.status !== "active" ||
+              this.run(run.leadId)?.tasks.find((entry) => entry.id === task.id)
+                ?.activeDispatchId !== dispatchId
+            )
+              continue;
             const prompt = workerTurnPrompt(
-              task.recoveryPrompt ?? task.prompt,
+              body,
               task.files,
               prepared.scratchDir,
+              preparedRun.brief,
             );
             this.host.submit(task.sessionId, prompt, (outcome) => {
               void this.settle(run.leadId, task.id, outcome, dispatchId).catch(
                 console.error,
               );
             });
-            if (
-              this.run(run.leadId)?.tasks.find((entry) => entry.id === task.id)
-                ?.activeDispatchId === dispatchId
-            )
-              await this.patchDispatch(run.leadId, dispatchId, {
-                state: "running",
-                stage: "turn_submitted",
-              });
+            const submitted = this.run(run.leadId)!;
+            const submittedAt = Date.now();
+            await this.commit({
+              ...submitted,
+              tasks: submitted.tasks.map((entry) =>
+                entry.id === task.id
+                  ? {
+                      ...entry,
+                      turns: (entry.turns ?? 0) + 1,
+                      startedAt: entry.startedAt ?? submittedAt,
+                    }
+                  : entry,
+              ),
+              dispatches: (submitted.dispatches ?? []).map((entry) =>
+                entry.id === dispatchId &&
+                submitted.tasks.some(
+                  (item) =>
+                    item.id === task.id && item.activeDispatchId === dispatchId,
+                )
+                  ? {
+                      ...entry,
+                      state: "running",
+                      stage: "turn_submitted",
+                      updatedAt: submittedAt,
+                    }
+                  : entry,
+              ),
+            });
           } catch (error) {
             await this.settle(
               run.leadId,
@@ -1629,14 +2135,17 @@ export class Orchestrator {
   ) {
     let task = this.run(leadId)?.tasks.find((entry) => entry.id === taskId);
     if (!task || task.activeDispatchId !== dispatchId) return;
+    const { storedResultChars } = orchestrationLimits(this.run(leadId)!);
+    const parsed = parseWorkerReport(outcome.text);
     if (task?.status === "cancelling") {
       if (outcome.text)
         await this.patchTask(leadId, taskId, {
-          result: outcome.text.slice(-20_000),
+          result: parsed.text.slice(-storedResultChars),
         });
       return;
     }
     if (task.status !== "running") return;
+    const changes = await this.readChanges(leadId, task);
     // A fast final response must not make an unchecked write reviewable.
     await Promise.all(this.writeChecks.get(dispatchId) ?? []);
     task = this.run(leadId)?.tasks.find((entry) => entry.id === taskId);
@@ -1648,20 +2157,36 @@ export class Orchestrator {
       return;
     this.writeChecks.delete(dispatchId);
     const run = this.run(leadId)!;
+    const now = Date.now();
+    // The turn itself is settled either way; a worker that says it is
+    // blocked goes straight to the lead instead of into automatic fixes.
+    const checkRunId =
+      outcome.status === "completed" &&
+      task.checks?.length &&
+      parsed.report?.status !== "blocked"
+        ? crypto.randomUUID()
+        : undefined;
+    const usage = turnTokens(this.host?.session(task.sessionId), task);
     await this.commit({
       ...run,
       tasks: run.tasks.map((entry) =>
         entry.id === taskId
           ? {
               ...entry,
-              status: outcome.status,
-              result: outcome.text.slice(-20_000),
+              ...turnEnded(run, entry, now),
+              ...usage,
+              status: checkRunId ? "checking" : outcome.status,
+              result: parsed.text.slice(-storedResultChars),
+              report: parsed.report,
+              changes,
               error: outcome.error,
               recoveryPrompt: undefined,
-              delivered: false,
+              delivered: !!checkRunId,
               accepted: false,
               activeDispatchId: undefined,
               lastDispatchId: dispatchId,
+              checkRunId,
+              checkResults: undefined,
             }
           : entry,
       ),
@@ -1671,8 +2196,8 @@ export class Orchestrator {
               ...dispatch,
               state: outcome.status,
               stage: "settled",
-              updatedAt: Date.now(),
-              result: outcome.text.slice(-20_000),
+              updatedAt: now,
+              result: parsed.text.slice(-storedResultChars),
               error: outcome.error,
             }
           : dispatch,
@@ -1680,8 +2205,337 @@ export class Orchestrator {
     });
     if (outcome.status === "failed")
       await this.cleanupUnchangedWorker(leadId, taskId);
+    const spent = budgetReason(this.run(leadId)!, false);
+    if (spent) await this.pause(leadId, budgetPause(spent));
+    if (checkRunId)
+      void this.runChecks(leadId, taskId, checkRunId).catch(console.error);
     void this.pump();
     this.sync();
+  }
+  /**
+   * Run a task's acceptance checks in order, in its retained checkout. Every
+   * step re-reads the task: a cancel, stop, pause or newer check run voids
+   * this one, and its late results are dropped.
+   */
+  private async runChecks(leadId: string, taskId: string, checkRunId: string) {
+    const current = () => {
+      const task = this.run(leadId)?.tasks.find((entry) => entry.id === taskId);
+      return task?.status === "checking" && task.checkRunId === checkRunId
+        ? task
+        : undefined;
+    };
+    const results: CheckResult[] = [];
+    let hostError: string | undefined;
+    for (const command of current()?.checks ?? []) {
+      const task = current();
+      const run = this.run(leadId);
+      if (!task || !run || !this.host) return;
+      try {
+        const outcome = await this.host.runCheck(run, task, command);
+        results.push({
+          command,
+          passed: outcome.exitCode === 0 && !outcome.timedOut,
+          exitCode: outcome.exitCode,
+          timedOut: outcome.timedOut,
+          durationMs: outcome.durationMs,
+          outputTail: outcome.output.slice(-CHECK_OUTPUT_CHARS),
+        });
+      } catch (error) {
+        hostError = messageOf(error);
+        results.push({
+          command,
+          passed: false,
+          exitCode: null,
+          timedOut: false,
+          durationMs: 0,
+          outputTail: `MonoCode could not run this check: ${hostError}`,
+        });
+      }
+      // Show progress while later checks run.
+      if (!current()) return;
+      await this.patchTask(leadId, taskId, { checkResults: [...results] });
+      if (hostError) break;
+    }
+    const task = current();
+    const run = this.run(leadId);
+    if (!task || !run) return;
+    const failed = results.filter((check) => !check.passed);
+    const retries = task.checkRetries ?? 0;
+    const { maxCheckRetries } = orchestrationLimits(run);
+    // The worker can fix its own failures; it cannot fix the app being
+    // unable to run a command, so that goes to the lead.
+    if (failed.length && !hostError && retries < maxCheckRetries) {
+      await this.commit({
+        ...run,
+        tasks: run.tasks.map((entry) =>
+          entry.id === taskId
+            ? {
+                ...entry,
+                status: "queued",
+                checkRunId: undefined,
+                checkResults: results,
+                checkRetries: retries + 1,
+                recoveryPrompt: checkFixTurn(
+                  failed,
+                  retries + 1,
+                  maxCheckRetries,
+                ),
+                delivered: true,
+                error: undefined,
+              }
+            : entry,
+        ),
+      });
+      void this.pump();
+      return;
+    }
+    const autoAccept =
+      !!run.autoAccept &&
+      results.length > 0 &&
+      !failed.length &&
+      (task.report?.status ?? "done") === "done";
+    await this.commit({
+      ...run,
+      tasks: run.tasks.map((entry) =>
+        entry.id === taskId
+          ? {
+              ...entry,
+              status: "completed",
+              checkRunId: undefined,
+              checkResults: results,
+              // Held back while auto-accept runs, so the lead hears the outcome.
+              delivered: autoAccept,
+              error: hostError
+                ? `Its acceptance checks could not run: ${hostError}. Inspect the command and the worker checkout, then review the task yourself.`
+                : entry.error,
+            }
+          : entry,
+      ),
+    });
+    if (autoAccept) await this.autoAccept(leadId, taskId);
+    void this.pump();
+    this.sync();
+  }
+  /**
+   * The review path for a task whose checks passed in an autoAccept run,
+   * serialized with the lead's own commands. A failure leaves the task
+   * completed for the lead, with the reason in its next wake-up.
+   */
+  private async autoAccept(leadId: string, taskId: string) {
+    const attempt = this.actions
+      .catch(() => undefined)
+      .then(async () => {
+        const run = this.run(leadId);
+        const task = run?.tasks.find((entry) => entry.id === taskId);
+        if (run?.status !== "active" || task?.status !== "completed") return;
+        if (task.accepted) return;
+        try {
+          await this.acceptTask(leadId, taskId);
+          await this.patchTask(leadId, taskId, {
+            autoAccepted: true,
+            autoAcceptError: undefined,
+          });
+        } catch (error) {
+          await this.patchTask(leadId, taskId, {
+            autoAcceptError: messageOf(error),
+          });
+        }
+      });
+    this.actions = attempt.catch(() => undefined);
+    try {
+      await attempt;
+    } finally {
+      const task = this.run(leadId)?.tasks.find(
+        (entry) => entry.id === taskId,
+      );
+      if (task?.status === "completed" && task.delivered)
+        await this.patchTask(leadId, taskId, { delivered: false });
+    }
+  }
+  /**
+   * Accept a completed task: integrate an isolated worker's changes into the
+   * lead checkout and remove its worktree. A review task changed nothing, so
+   * accepting it only records it and removes its checkout if still unchanged.
+   */
+  private async acceptTask(
+    leadId: string,
+    taskId: string,
+  ): Promise<{
+    integrated: boolean;
+    cleaned: boolean;
+    cleanupError?: string;
+    merged?: string[];
+  }> {
+    let target = this.run(leadId)!.tasks.find((entry) => entry.id === taskId)!;
+    const dispatchId = target.lastDispatchId;
+    if (!dispatchId)
+      throw new Error("This task has no completed dispatch to review");
+    if (target.kind === "review") {
+      if (!target.accepted) {
+        const current = this.run(leadId)!;
+        await this.commit({
+          ...current,
+          tasks: current.tasks.map((entry) =>
+            entry.id === taskId
+              ? { ...entry, accepted: true, acceptedDispatchId: dispatchId }
+              : entry,
+          ),
+        });
+      }
+      return {
+        integrated: false,
+        cleaned: await this.cleanupUnchangedWorker(leadId, taskId),
+      };
+    }
+    const isolated = target.workspacePolicy !== "shared";
+    let merged: string[] | undefined;
+    if (!target.accepted) {
+      if (isolated) {
+        if (!target.workspace)
+          throw new Error(
+            "This worker's isolated checkout is unavailable. Its changes were not accepted.",
+          );
+        await this.patchDispatch(leadId, dispatchId, {
+          stage: "integration_started",
+          cleanupError: undefined,
+        });
+        const applied = await this.host!.integrateWorker(
+          this.run(leadId)!,
+          target,
+        );
+        merged = applied?.merged;
+      }
+      const current = this.run(leadId)!;
+      await this.commit({
+        ...current,
+        tasks: current.tasks.map((entry) =>
+          entry.id === taskId
+            ? {
+                ...entry,
+                accepted: true,
+                acceptedDispatchId: dispatchId,
+              }
+            : entry,
+        ),
+        dispatches: (current.dispatches ?? []).map((dispatch) =>
+          dispatch.id === dispatchId
+            ? {
+                ...dispatch,
+                stage: isolated ? "integrated" : dispatch.stage,
+                updatedAt: Date.now(),
+              }
+            : dispatch,
+        ),
+      });
+      target = this.run(leadId)!.tasks.find((entry) => entry.id === taskId)!;
+    }
+
+    let cleaned = !isolated;
+    let cleanupError: string | undefined;
+    if (isolated) {
+      try {
+        cleaned = await this.host!.cleanupWorker(
+          this.run(leadId)!,
+          target,
+          false,
+        );
+      } catch (error) {
+        cleanupError = messageOf(error);
+      }
+      const current = this.run(leadId)!;
+      await this.commit({
+        ...current,
+        tasks: current.tasks.map((entry) =>
+          entry.id === taskId && cleaned
+            ? { ...entry, workspace: undefined }
+            : entry,
+        ),
+        dispatches: (current.dispatches ?? []).map((dispatch) =>
+          dispatch.id === dispatchId
+            ? {
+                ...dispatch,
+                ...(cleaned ? { stage: "cleaned" as const } : {}),
+                cleanupError,
+                updatedAt: Date.now(),
+              }
+            : dispatch,
+        ),
+      });
+    }
+    return {
+      integrated: isolated,
+      cleaned,
+      ...(cleanupError ? { cleanupError } : {}),
+      ...(merged?.length ? { merged } : {}),
+    };
+  }
+  /**
+   * First turn of a review task: the reviewed tasks' instructions, reports
+   * and patches, inside one byte budget split evenly between them.
+   */
+  private async reviewPrompt(leadId: string, taskId: string): Promise<string> {
+    const run = this.run(leadId)!;
+    const task = run.tasks.find((entry) => entry.id === taskId)!;
+    const { leadResultChars } = orchestrationLimits(run);
+    const targets = (task.reviewOf ?? []).flatMap((id) => {
+      const target = run.tasks.find((entry) => entry.id === id);
+      return target ? [target] : [];
+    });
+    const share = Math.max(
+      DIFF_BYTES.min,
+      Math.floor(REVIEW_PATCH_BYTES / Math.max(1, targets.length)),
+    );
+    const lead = orchestrationCheckoutCwd(run);
+    const sections = await Promise.all(
+      targets.map(async (target) => {
+        let patch: string;
+        if (target.workspacePolicy !== "shared" && !target.workspace)
+          patch = target.accepted
+            ? `Patch unavailable: this task was already accepted into the lead checkout at ${JSON.stringify(lead)}. Read its changed files there, without editing them.`
+            : "Patch unavailable: this task's checkout no longer exists. Review its report and say so in your verdict.";
+        else
+          try {
+            const diff = await this.host!.workerDiff(run, target, share);
+            const where = target.workspace?.checkoutCwd ?? lead;
+            patch = `${diff.patch.trimEnd() || "(empty patch)"}${
+              diff.truncated
+                ? `\n[Patch truncated at ${share} bytes. Read the remaining changed files in ${JSON.stringify(where)} without editing them.]`
+                : ""
+            }`;
+          } catch (error) {
+            patch = `Patch unavailable: ${messageOf(error)}.`;
+          }
+        return `<reviewed_task id="${target.id}">\nTitle: ${target.title}\n\nOriginal instructions:\n${target.prompt}\n\nResult:\n${leadResultText(target, leadResultChars)}\n\nPatch:\n${patch}\n</reviewed_task>`;
+      }),
+    );
+    return `${task.prompt}\n\nYou are reviewing the work of ${targets.length === 1 ? "another worker" : "other workers"} for the lead. Each section below holds a task's original instructions, its result and the patch of its uncommitted changes, which live in its own checkout. Check correctness, fidelity to the instructions and their file scope, missing or weak tests, and risky side effects. You may read any project file for context and run read-only commands, but never edit, create or delete files. Name each finding with its file and line, most important first.\n\nYour <monocode_result> is your verdict on every reviewed task: status "done" approves them as they are; "partial" or "blocked" requests changes, with each required change in blockers and optional suggestions in followUps. Leave changedFiles empty.\n\n${sections.join("\n\n")}`;
+  }
+  /**
+   * Files a finished turn actually changed. Best-effort: settling must never
+   * depend on reading the checkpoint, so any failure records no changes.
+   */
+  private async readChanges(
+    leadId: string,
+    task: OrchestrationTask,
+  ): Promise<WorkerChange[] | undefined> {
+    const run = this.run(leadId);
+    if (!run || !this.host?.workerChanges) return undefined;
+    if (task.workspacePolicy !== "shared" && !task.workspace) return undefined;
+    try {
+      const changes = await this.host.workerChanges(run, task);
+      if (!Array.isArray(changes)) return undefined;
+      return changes
+        .slice(0, MAX_RECORDED_CHANGES)
+        .map(({ relative, status, additions, deletions }) => ({
+          relative,
+          status,
+          additions,
+          deletions,
+        }));
+    } catch (error) {
+      console.warn("Could not read the worker's changed files", error);
+      return undefined;
+    }
   }
   async cancelTask(leadId: string, taskId: string) {
     const task = this.run(leadId)?.tasks.find((entry) => entry.id === taskId);
@@ -1701,11 +2555,14 @@ export class Orchestrator {
         entry.id === taskId
           ? {
               ...entry,
+              ...turnEnded(run, entry),
               status: "cancelled",
               accepted: false,
               delivered: false,
               activeDispatchId: undefined,
               recoveryPrompt: undefined,
+              checkRunId: undefined,
+              recheck: undefined,
               ...(dispatchId ? { lastDispatchId: dispatchId } : {}),
             }
           : entry,
@@ -1742,6 +2599,7 @@ export class Orchestrator {
         entry.id === taskId
           ? {
               ...entry,
+              ...turnEnded(run, entry),
               status: "interrupted",
               accepted: false,
               delivered: true,
@@ -1783,6 +2641,7 @@ export class Orchestrator {
         entry.id === taskId
           ? {
               ...entry,
+              ...turnEnded(run, entry),
               status: "blocked",
               accepted: false,
               delivered: false,
@@ -1822,11 +2681,18 @@ export class Orchestrator {
   ) {
     const run = this.run(leadId);
     if (!run || run.status !== "active") return;
+    this.clearWake(leadId);
+    const paused = patch ? patch(run) : run;
+    // Checks hold no worker process, so they stop at once and run again on Resume.
     await this.commit({
-      ...(patch ? patch(run) : run),
+      ...paused,
+      ...settleActiveTime(run),
       status: "paused",
       error,
       lastPauseReason: error,
+      tasks: paused.tasks.map((task) =>
+        task.status === "checking" ? checksInterrupted(task, error) : task,
+      ),
     });
     // Serialize state transitions: parallel commits here can resurrect an
     // already-stopped worker from an older snapshot.
@@ -1838,8 +2704,13 @@ export class Orchestrator {
   async stopRun(leadId: string) {
     const run = this.run(leadId);
     if (!run) return;
+    this.clearWake(leadId);
     let saveError: unknown;
-    await this.commit({ ...run, status: "stopped" }).catch((error: unknown) => {
+    await this.commit({
+      ...run,
+      ...settleActiveTime(run),
+      status: "stopped",
+    }).catch((error: unknown) => {
       saveError = error;
     });
     await Promise.all(
@@ -1853,13 +2724,15 @@ export class Orchestrator {
       ...latest,
       status: "stopped",
       tasks: latest.tasks.map((task) =>
-        activeTask(task) || task.status === "queued"
+        busyTask(task) || task.status === "queued"
           ? {
               ...task,
+              ...turnEnded(latest, task),
               status: "cancelled",
               accepted: false,
               delivered: true,
               activeDispatchId: undefined,
+              checkRunId: undefined,
               ...(task.activeDispatchId
                 ? { lastDispatchId: task.activeDispatchId }
                 : {}),
@@ -1909,7 +2782,7 @@ export class Orchestrator {
       !run ||
       (run.status !== "active" &&
         run.status !== "paused" &&
-        !run.tasks.some(activeTask))
+        !run.tasks.some(busyTask))
     )
       return null;
     if (run.leadId === id) return this.stopRun(id);
@@ -1926,7 +2799,7 @@ export class Orchestrator {
           run &&
           (run.status === "active" ||
             run.status === "paused" ||
-            run.tasks.some(activeTask))
+            run.tasks.some(busyTask))
         ) {
           await this.stopRun(run.leadId);
         }
@@ -1938,6 +2811,7 @@ export class Orchestrator {
         this.persisted.delete(run.leadId);
         this.blocked.delete(run.leadId);
         this.announced.delete(run.leadId);
+        this.clearWake(run.leadId);
         this.emit();
         if (run.leadId !== id) {
           // Read the transaction's pruned graph; never save the pre-delete snapshot.
@@ -1977,118 +2851,177 @@ export class Orchestrator {
         this.emit();
       }
     }
+    const now = Date.now();
     for (const run of this.runs) {
-      if (run.status !== "active" || this.waking.has(run.leadId)) continue;
-      const lead = this.host?.session(run.leadId);
-      if (!lead || lead.busy || lead.queuedMessages?.length) continue;
+      if (run.status !== "active") {
+        this.clearWake(run.leadId);
+        continue;
+      }
+      if (this.waking.has(run.leadId)) continue;
       const announced = this.announced.get(run.leadId) ?? new Set<string>();
-      const results = run.tasks.filter((task) => !task.delivered);
+      const results = run.tasks.filter(deliverable);
       const blocked = this.blockedKeys(run).filter(
         (key) => !announced.has(key),
       );
-      if (!results.length && !blocked.length) continue;
-      this.waking.add(run.leadId);
-      // Let session state settle before checking idle; never interrupt user input.
-      setTimeout(() => {
-        void (async () => {
-          try {
-            const current = this.run(run.leadId);
-            const session = this.host?.session(run.leadId);
-            if (
-              !current ||
-              current.status !== "active" ||
-              !session ||
-              session.busy ||
-              session.queuedMessages?.length
-            )
-              return;
-            const results = current.tasks.filter(
-              (task) =>
-                !task.delivered &&
-                !activeTask(task) &&
-                task.status !== "queued",
+      if (!results.length && !blocked.length) {
+        this.clearWake(run.leadId);
+        continue;
+      }
+      const since = this.pendingSince.get(run.leadId) ?? now;
+      this.pendingSince.set(run.leadId, since);
+      // Never interrupt the lead or queued user input: the sync that follows
+      // its turn schedules the wake-up, already due if the window has passed.
+      const lead = this.host?.session(run.leadId);
+      if (!lead || lead.busy || lead.queuedMessages?.length) continue;
+      // Completions landing close together share one continuation turn. A
+      // worker blocked on the lead cannot progress, so it is never batched.
+      this.scheduleWake(
+        run.leadId,
+        blocked.length ? now : since + orchestrationLimits(run).wakeBatchMs,
+      );
+    }
+  }
+  /** Keep the earliest due wake-up; a later event never postpones it. */
+  private scheduleWake(leadId: string, due: number) {
+    const pending = this.wakeTimers.get(leadId);
+    if (pending && pending.due <= due) return;
+    if (pending) clearTimeout(pending.timer);
+    const timer = setTimeout(
+      () => {
+        this.wakeTimers.delete(leadId);
+        void this.wake(leadId);
+      },
+      Math.max(0, due - Date.now()),
+    );
+    this.wakeTimers.set(leadId, { timer, due });
+  }
+  private clearWake(leadId: string) {
+    const pending = this.wakeTimers.get(leadId);
+    if (pending) clearTimeout(pending.timer);
+    this.wakeTimers.delete(leadId);
+    this.pendingSince.delete(leadId);
+  }
+  /** Deliver every pending result and request to an idle lead in one turn. */
+  private async wake(leadId: string) {
+    if (this.waking.has(leadId)) return;
+    this.waking.add(leadId);
+    try {
+      const current = this.run(leadId);
+      const session = this.host?.session(leadId);
+      if (
+        !current ||
+        current.status !== "active" ||
+        !session ||
+        session.busy ||
+        session.queuedMessages?.length
+      )
+        return;
+      const results = current.tasks.filter(deliverable);
+      const seen = this.announced.get(leadId) ?? new Set<string>();
+      const waiting = current.tasks.flatMap((task) => {
+        const pending = this.pendingInput(task);
+        const key = pending && `${task.id}:${pending.requestId}`;
+        return key && !seen.has(key) ? [{ task, pending, key }] : [];
+      });
+      if (!results.length && !waiting.length) return;
+      const limits = orchestrationLimits(current);
+      if (current.continuations >= limits.maxContinuations) {
+        await this.pause(
+          leadId,
+          "Automatic continuation limit reached. Its agents were stopped; review and resume the run.",
+        );
+        return;
+      }
+      this.pendingSince.delete(leadId);
+      await this.commit({
+        ...current,
+        continuations: current.continuations + 1,
+        lastPauseReason: undefined,
+        tasks: current.tasks.map((task) =>
+          results.some((item) => item.id === task.id)
+            ? { ...task, delivered: true }
+            : task,
+        ),
+      });
+      this.announced.set(
+        leadId,
+        new Set([...seen, ...waiting.map((entry) => entry.key)]),
+      );
+      // Work first, each with the verdicts already given on it; then the
+      // reviews themselves, whose findings say what to change.
+      const summary = [
+        ...results.filter((task) => task.kind !== "review"),
+        ...results.filter((task) => task.kind === "review"),
+      ]
+        .map((task) => {
+          const verdicts = (reviewsOf(current, task) ?? [])
+            .filter((review) => review.verdict)
+            .map(
+              (review) =>
+                `Review ${review.taskId} — ${review.title}: ${review.verdict}`,
             );
-            const seen = this.announced.get(run.leadId) ?? new Set<string>();
-            const waiting = current.tasks.flatMap((task) => {
-              const pending = this.pendingInput(task);
-              const key = pending && `${task.id}:${pending.requestId}`;
-              return key && !seen.has(key) ? [{ task, pending, key }] : [];
-            });
-            if (!results.length && !waiting.length) return;
-            if (current.continuations >= 20) {
-              await this.pause(
-                run.leadId,
-                "Automatic continuation limit reached. Its agents were stopped; review and resume the run.",
-              );
-              return;
-            }
-            await this.commit({
-              ...current,
-              continuations: current.continuations + 1,
-              lastPauseReason: undefined,
-              tasks: current.tasks.map((task) =>
-                results.some((item) => item.id === task.id)
-                  ? { ...task, delivered: true }
-                  : task,
-              ),
-            });
-            this.announced.set(
-              run.leadId,
-              new Set([...seen, ...waiting.map((entry) => entry.key)]),
-            );
-            const summary = results
-              .map(
-                (task) =>
-                  `${task.id} — ${task.title}: ${task.status}\n${task.error ?? ""}\n${task.result.slice(-4000)}`,
-              )
-              .join("\n\n");
-            const asks = waiting
-              .map(
-                ({ task, pending }) =>
-                  `${task.id} — ${task.title} needs ${pending.kind === "approval" ? "an approval" : "an answer"} (requestId ${pending.requestId}): ${pending.label}\n${pending.detail?.slice(0, 2000) ?? ""}${
-                    pending.questions
-                      ? `\n${JSON.stringify(pending.questions)}`
-                      : ""
-                  }`,
-              )
-              .join("\n\n");
-            const body = [
-              current.lastPauseReason
-                ? `Previous interruption: ${current.lastPauseReason}\nInterrupted workers were continued from their retained checkouts. Inspect their results normally before review. Policy-blocked tasks were not restarted; correct or explicitly re-scope those tasks before retrying them. Dependent validation remains queued until its prerequisites pass review.`
+          return [leadResultText(task, limits.leadResultChars), ...verdicts].join(
+            "\n",
+          );
+        })
+        .join("\n\n");
+      const usage = `Run usage: ${orchestrationUsageText(orchestrationUsage(current))}${
+        current.budget
+          ? `; budget ${[
+              current.budget.maxMinutes
+                ? `${current.budget.maxMinutes} minutes`
                 : "",
-              results.length
-                ? `Worker results are ready. Review the work, request corrections through the CLI when needed, and finish the original task.\n\n${summary}`
-                : "",
-              waiting.length
-                ? `These agents are blocked waiting on you. Decide each one with respond or answer; they stay stopped until you do. Judge it against the task you assigned, and ask the user in this conversation only when the call is genuinely theirs to make.\n\n${asks}`
+              current.budget.maxWorkerTurns
+                ? `${current.budget.maxWorkerTurns} worker turns`
                 : "",
             ]
               .filter(Boolean)
-              .join("\n\n");
-            this.host!.submit(run.leadId, body, (outcome) => {
-              if (outcome.status !== "completed") {
-                void this.pause(
-                  run.leadId,
-                  outcome.error ??
-                    "Lead continuation was interrupted. Its agents were stopped; review and resume.",
-                  (current) => ({
-                    ...current,
-                    tasks: current.tasks.map((task) =>
-                      results.some((item) => item.id === task.id)
-                        ? { ...task, delivered: false }
-                        : task,
-                    ),
-                  }),
-                ).catch(console.error);
-              } else this.sync();
-            });
-          } catch (error) {
-            console.error("Orchestration continuation failed", error);
-          } finally {
-            this.waking.delete(run.leadId);
-          }
-        })();
-      }, 0);
+              .join(", ")}`
+          : ""
+      }.`;
+      const asks = waiting
+        .map(
+          ({ task, pending }) =>
+            `${task.id} — ${task.title} needs ${pending.kind === "approval" ? "an approval" : "an answer"} (requestId ${pending.requestId}): ${pending.label}\n${pending.detail?.slice(0, 2000) ?? ""}${
+              pending.questions ? `\n${JSON.stringify(pending.questions)}` : ""
+            }`,
+        )
+        .join("\n\n");
+      const body = [
+        current.lastPauseReason
+          ? `Previous interruption: ${current.lastPauseReason}\nInterrupted workers were continued from their retained checkouts. Inspect their results normally before review. Policy-blocked tasks were not restarted; correct or explicitly re-scope those tasks before retrying them. Dependent validation remains queued until its prerequisites pass review.`
+          : "",
+        results.length
+          ? `Worker results are ready. Inspect each patch with diff, request corrections through the CLI when needed, accept finished work with review, and finish the original task. If other workers are still running, end your turn when you are done here; MonoCode wakes you with their results.\n\n${summary}`
+          : "",
+        waiting.length
+          ? `These agents are blocked waiting on you. Decide each one with respond or answer; they stay stopped until you do. Judge it against the task you assigned, and ask the user in this conversation only when the call is genuinely theirs to make.\n\n${asks}`
+          : "",
+        usage,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      this.host!.submit(leadId, body, (outcome) => {
+        if (outcome.status !== "completed") {
+          void this.pause(
+            leadId,
+            outcome.error ??
+              "Lead continuation was interrupted. Its agents were stopped; review and resume.",
+            (current) => ({
+              ...current,
+              tasks: current.tasks.map((task) =>
+                results.some((item) => item.id === task.id)
+                  ? { ...task, delivered: false }
+                  : task,
+              ),
+            }),
+          ).catch(console.error);
+        } else this.sync();
+      });
+    } catch (error) {
+      console.error("Orchestration continuation failed", error);
+    } finally {
+      this.waking.delete(leadId);
     }
   }
   observe(id: string, event: HarnessEvent) {

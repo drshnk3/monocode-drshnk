@@ -25,6 +25,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import {
   orchestrationCheckoutCwd,
+  orchestrationLimits,
   orchestrationProjectCwd,
   orchestrator,
   shellPath,
@@ -120,6 +121,10 @@ import {
   saveProjectSidebarTab,
 } from "../features/settings/model/projectSidebarTab";
 import { HAS_NATIVE_GLASS, IS_MAC } from "../platform/tauri/platform";
+import {
+  runOrchestrationCheck,
+  sessionCheckpointPatch,
+} from "../platform/tauri/orchestrationNative";
 import {
   applyUiScale,
   loadUiScale,
@@ -9006,16 +9011,38 @@ function Workspace({
           throw new Error(
             "The worker or lead checkout is no longer registered. The worker worktree was kept.",
           );
-        if (workerTree.head !== leadTree.head)
-          throw new Error(
-            "The worker or lead branch moved while this task was running. The worker worktree was kept for manual review.",
-          );
+        // A moved lead HEAD is fine: apply merges per file and refuses only
+        // when the worker's own HEAD moved or an edit conflicts.
         return applySessionCheckpoint(
           task.sessionId,
           fromCwd,
           orchestrationCheckoutCwd(run),
         );
       },
+      workerChanges: async (run, task) => {
+        // Size 0 reads only the changed-file summary, never the patch text.
+        const { files } = await sessionCheckpointPatch(
+          task.sessionId,
+          task.workspace?.checkoutCwd ?? orchestrationCheckoutCwd(run),
+          0,
+        );
+        return files;
+      },
+      workerDiff: (run, task, maxBytes) =>
+        sessionCheckpointPatch(
+          task.sessionId,
+          task.workspace?.checkoutCwd ?? orchestrationCheckoutCwd(run),
+          maxBytes,
+        ),
+      // The worker's own scratch dir becomes the check's TMPDIR, keeping
+      // check output inside the space the worker is already allowed to use.
+      runCheck: (run, task, command) =>
+        runOrchestrationCheck({
+          cwd: task.workspace?.checkoutCwd ?? orchestrationCheckoutCwd(run),
+          command,
+          timeoutMs: orchestrationLimits(run).checkTimeoutMs,
+          scratchDir: task.scratchDir,
+        }),
       cleanupWorker: async (run, task, onlyIfUnchanged) => {
         const workspace = task.workspace;
         if (!workspace || workspace.kind !== "worktree") return true;
@@ -9032,9 +9059,13 @@ function Workspace({
         const leadTree = listed.worktrees.find((tree) =>
           sameProjectPath(tree.path, orchestrationCheckoutCwd(run)),
         );
+        // Unconditional cleanup re-applies below, which tolerates a moved lead
+        // HEAD; the "only if unchanged" path stays conservative.
         if (
           exists &&
-          (!workerTree || !leadTree || workerTree.head !== leadTree.head)
+          (!workerTree ||
+            !leadTree ||
+            (onlyIfUnchanged && workerTree.head !== leadTree.head))
         ) {
           if (onlyIfUnchanged) return false;
           throw new Error(

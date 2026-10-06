@@ -39,13 +39,19 @@ export async function createWorktree(
   return tree;
 }
 
+/**
+ * `dependencyDirs` names git-ignored folders (any depth) cloned copy-on-write
+ * from the lead; omit it for node_modules, .venv and venv.
+ */
 export async function createOrchestrationWorktree(
   cwd: string,
   branch: string,
+  dependencyDirs?: string[],
 ) {
   const tree = await invoke<Worktree>("git_orchestration_worktree_create", {
     cwd,
     branch,
+    dependencyDirs,
   });
   notifyGitChanged();
   return tree;

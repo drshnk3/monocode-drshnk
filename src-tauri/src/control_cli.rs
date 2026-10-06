@@ -15,17 +15,27 @@ Actions, with the JSON object each one takes:
             harness/model IDs you may assign.
   delegate  {"title":"Short title","harness":"<id from list>",
              "model":"<id from list>","prompt":"Self-contained instructions",
-             "files":["src/feature"],"dependsOn":["<taskId>"]}
+             "files":["src/feature"],"dependsOn":["<taskId>"],
+             "checks":["npm test"],"kind":"work","reviewOf":["<taskId>"]}
             Queue a worker and return its taskId. "model" is optional and
             defaults to the first model list allows for that harness.
             "files" is the write scope: project-relative paths, where a
             directory covers its descendants and ["."] reserves the whole
             checkout. "dependsOn" holds taskIds that must be reviewed first.
+            Optional "checks" are shell commands the app runs in the worker's
+            checkout after it finishes; failures go back to the worker
+            automatically. "kind" is "work" (default) or "review"; a review
+            task inspects the tasks in "reviewOf".
   get       {"taskId":"..."}
             One task, including its latest result.
+  diff      {"taskId":"...","maxBytes":60000}
+            The worker's changed files and a unified patch of its changes.
+            "maxBytes" is optional (1000-200000); "truncated" reports a cut
+            patch.
   wait      {"timeoutSeconds":20}
             Block until a task changes state, or until the timeout (0-25).
             Returns at once when paused, stopped, or nothing is running or queued.
+            Use it only when you need a result within this turn.
   respond   {"taskId":"...","requestId":7,"decision":"allow"|"deny"}
             Answer an approval an agent is blocked on. Agents never prompt the
             user; list, get and wait report the prompt as that task's
@@ -50,9 +60,11 @@ Actions, with the JSON object each one takes:
   finish    {}
             End the run, once every task is accepted or cancelled.
 
-Usual loop: list -> delegate ... -> wait or get -> steer an agent that drifts,
-unblock one with respond or answer -> inspect the changes yourself -> message
-for corrections -> review each task -> finish.
+Usual loop: list -> delegate the tasks -> end your turn. Do not poll: MonoCode
+wakes you with the results, or when a task needs input. Then unblock tasks with
+respond or answer, steer one that drifts, inspect each result with diff, send
+corrections with message, review each task, and finish. Call wait only when
+you need a result before this turn can end, and keep it bounded.
 
 When paused, list, get and wait still return the reason and recovery steps.
 Do not keep polling or retry mutations. Explain the pause and ask the user to
@@ -78,9 +90,9 @@ MonoCode sets MONOCODE_CONTROL_ENDPOINT and MONOCODE_CONTROL_TOKEN for the lead
 agent's process only. They are already in your environment; never print them.
 "#;
 
-const ACTIONS: [&str; 12] = [
-    "list", "delegate", "get", "steer", "message", "retry", "cancel", "wait", "review", "finish",
-    "respond", "answer",
+const ACTIONS: [&str; 13] = [
+    "list", "delegate", "get", "diff", "steer", "message", "retry", "cancel", "wait", "review",
+    "finish", "respond", "answer",
 ];
 const APP_ACTIONS: [&str; 13] = [
     "models.list",
@@ -502,6 +514,24 @@ mod tests {
         }
         assert!(!text.contains("{exe}"));
         assert!(text.contains("--request-id"));
+        for field in ["\"maxBytes\"", "\"checks\"", "\"kind\"", "\"reviewOf\""] {
+            assert!(text.contains(field), "help omits {field}");
+        }
+    }
+    #[test]
+    fn accepts_diff_and_review_delegation() {
+        let (action, input, _) =
+            call(&["diff", "--json", r#"{"taskId":"t1","maxBytes":2000}"#]).unwrap();
+        assert_eq!(action, "diff");
+        assert_eq!(input["maxBytes"], 2000);
+        let (_, input, _) = call(&[
+            "delegate",
+            "--json",
+            r#"{"prompt":"Review","kind":"review","reviewOf":["t1"],"checks":["npm test"]}"#,
+        ])
+        .unwrap();
+        assert_eq!(input["reviewOf"][0], "t1");
+        assert_eq!(input["checks"][0], "npm test");
     }
     #[test]
     fn quotes_the_control_path_only_when_the_shell_needs_it() {

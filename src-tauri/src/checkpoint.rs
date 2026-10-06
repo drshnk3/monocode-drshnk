@@ -16,6 +16,7 @@ use crate::fs::{
 };
 
 const MAX_SNAPSHOT_FILES: usize = 500;
+const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct CheckpointStore {
@@ -82,6 +83,10 @@ impl CheckpointStore {
                 after: BTreeMap::new(),
                 stats: BTreeMap::new(),
                 diverged: BTreeSet::new(),
+                head: git_head(&root)
+                    .ok()
+                    .map(|head| String::from_utf8_lossy(&head).trim().to_string()),
+                integrated: BTreeMap::new(),
             },
         )
     }
@@ -205,7 +210,7 @@ impl CheckpointStore {
         from_cwd: &str,
         to_cwd: &str,
     ) -> Result<CheckpointApplyResult, String> {
-        let manifest = self
+        let mut manifest = self
             .load_matching(session_id, from_cwd)?
             .ok_or("This worker has no recoverable change checkpoint")?;
         let from_root = project_root(from_cwd)?;
@@ -213,7 +218,14 @@ impl CheckpointStore {
         if same_cwd(from_cwd, to_cwd) {
             return Err("An isolated worker cannot be integrated into itself".into());
         }
-        if git_head(&from_root)? != git_head(&to_root)? {
+        let from_head = git_head(&from_root)?;
+        let moved = match manifest.head.as_deref() {
+            // Files are merged against the worker's own baseline, so only a
+            // worker commit (which hides changes from capture) is unsafe.
+            Some(head) => String::from_utf8_lossy(&from_head).trim() != head,
+            None => from_head != git_head(&to_root)?,
+        };
+        if moved {
             return Err(
                 "The worker or lead branch moved while this task was running. The worker worktree was kept for manual review."
                     .into(),
@@ -223,9 +235,12 @@ impl CheckpointStore {
         let changed = verified_worker_delta(&dir, &from_root, &manifest)?;
 
         // Preflight every path before writing any of them. A retry may see a
-        // mixture of before/after states if the app stopped during a previous
-        // application; both are safe and make this operation idempotent.
+        // mixture of before/after/merged states if the app stopped during a
+        // previous application; all are safe and make this idempotent.
         let mut already_applied = 0;
+        let mut writes = Vec::new();
+        let mut merged = Vec::new();
+        let mut conflicts = Vec::new();
         for relative in &changed {
             if path_contains_symlink(&to_root, relative) {
                 return Err(format!(
@@ -245,26 +260,36 @@ impl CheckpointStore {
             let target = worktree_snapshot(&to_root, relative);
             let before_state = stored_snapshot(&dir, relative, before, false);
             let after_state = stored_snapshot(&dir, relative, after, true);
-            if target == after_state {
+            if target == after_state || integrated_matches(&manifest, relative, &target) {
                 already_applied += 1;
-            } else if target != before_state {
-                return Err(format!(
-                    "Cannot integrate {relative}: the lead checkout changed since this worker started. The worker worktree was kept."
-                ));
+            } else if target == before_state {
+                writes.push((relative.clone(), after_state));
+            } else if let Some(result) = merge_text(&dir, &target, &before_state, &after_state)? {
+                if let Some(record) = IntegratedFile::of(&result) {
+                    manifest.integrated.insert(relative.clone(), record);
+                }
+                merged.push(relative.clone());
+                writes.push((relative.clone(), result));
+            } else {
+                conflicts.push(relative.clone());
             }
         }
-
-        for relative in &changed {
-            let after = manifest.after.get(relative).copied().unwrap();
-            let target = worktree_snapshot(&to_root, relative);
-            let after_state = stored_snapshot(&dir, relative, after, true);
-            if target != after_state {
-                write_state(&to_root, relative, after_state.0, after_state.1)?;
-            }
+        if !conflicts.is_empty() {
+            return Err(format!(
+                "Cannot integrate {}: the lead checkout changed since this worker started and the edits could not be merged. The worker worktree was kept.",
+                conflicts.join(", ")
+            ));
+        }
+        if !merged.is_empty() {
+            write_manifest(&dir, &manifest)?;
+        }
+        for (relative, (state, mode)) in writes {
+            write_state(&to_root, &relative, state, mode)?;
         }
         Ok(CheckpointApplyResult {
             files: changed,
             already_applied,
+            merged,
         })
     }
 
@@ -344,6 +369,70 @@ impl CheckpointStore {
             binary,
             too_large,
         })
+    }
+
+    /// The session's changes as one git-style unified diff, from the same
+    /// before/after snapshots that review and integration use.
+    fn patch(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        max_bytes: usize,
+    ) -> Result<CheckpointPatch, String> {
+        let status = self.status(session_id, cwd)?;
+        let mut out = CheckpointPatch {
+            files: Vec::new(),
+            patch: String::new(),
+            truncated: false,
+        };
+        let Some(manifest) = self.load_matching(session_id, cwd)? else {
+            return Ok(out);
+        };
+        let dir = self.session_dir(session_id);
+        let max_bytes = max_bytes.min(MAX_PATCH_BYTES);
+        for file in status.files {
+            let relative = file.relative;
+            let before = manifest
+                .files
+                .get(&relative)
+                .map(|kind| stored_snapshot(&dir, &relative, *kind, false));
+            let after = manifest
+                .after
+                .get(&relative)
+                .map(|kind| stored_snapshot(&dir, &relative, *kind, true));
+            let binary = [&before, &after]
+                .into_iter()
+                .flatten()
+                .any(|(state, _)| state_is_binary(state));
+            if !out.truncated {
+                if max_bytes == 0 {
+                    out.truncated = true;
+                } else {
+                    let chunk = match (before, after) {
+                        (Some(before), Some(after)) => file_patch(
+                            &dir,
+                            &relative,
+                            before,
+                            after,
+                            binary,
+                            !file.exact,
+                        )?,
+                        _ => format!(
+                            "diff --git a/{relative} b/{relative}\nSession snapshots are unavailable\n"
+                        ),
+                    };
+                    out.truncated = !append_capped(&mut out.patch, &chunk, max_bytes);
+                }
+            }
+            out.files.push(CheckpointPatchFile {
+                relative,
+                status: file.status,
+                additions: file.additions,
+                deletions: file.deletions,
+                binary,
+            });
+        }
+        Ok(out)
     }
 
     /// Remaining git line counts for each session, using one working-tree index.
@@ -496,6 +585,33 @@ struct Manifest {
     /// Paths whose contents changed between two edits by this session.
     #[serde(default)]
     diverged: BTreeSet<String>,
+    /// Checkout HEAD when the checkpoint started. Absent in older manifests.
+    #[serde(default)]
+    head: Option<String>,
+    /// Lead results of three-way merges, written before the files so a
+    /// retried integration recognizes them instead of merging twice.
+    #[serde(default)]
+    integrated: BTreeMap<String, IntegratedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct IntegratedFile {
+    sha256: String,
+    mode: Option<u32>,
+}
+
+impl IntegratedFile {
+    fn of((state, mode): &FileWithMode) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        let FileState::Contents(bytes) = state else {
+            return None;
+        };
+        Some(Self {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            mode: *mode,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -520,6 +636,9 @@ enum FileState {
     Missing,
     Skipped,
 }
+
+/// A file state with its Unix permission bits, when known.
+type FileWithMode = (FileState, Option<u32>);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -555,9 +674,30 @@ pub struct CheckpointFileDiff {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CheckpointPatchFile {
+    pub relative: String,
+    pub status: String,
+    pub additions: i64,
+    pub deletions: i64,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointPatch {
+    pub files: Vec<CheckpointPatchFile>,
+    pub patch: String,
+    /// The patch stopped at the byte limit; `files` is always complete.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckpointApplyResult {
     pub files: Vec<String>,
     pub already_applied: usize,
+    /// Files the lead had also changed, combined by a clean three-way merge.
+    pub merged: Vec<String>,
 }
 
 pub fn init(app: &AppHandle) -> Result<(), String> {
@@ -699,6 +839,22 @@ pub async fn session_checkpoint_file_diff(
 }
 
 #[tauri::command]
+pub async fn session_checkpoint_patch(
+    store: State<'_, CheckpointStore>,
+    session_id: String,
+    root: String,
+    max_bytes: usize,
+) -> Result<CheckpointPatch, String> {
+    validate_id(&session_id, "session")?;
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.exclusive(|store| store.patch(&session_id, &root, max_bytes))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn session_checkpoint_undo(
     store: State<'_, CheckpointStore>,
     session_id: String,
@@ -810,6 +966,198 @@ fn verified_worker_delta(
     }
     changed.sort();
     Ok(changed)
+}
+
+fn integrated_matches(manifest: &Manifest, relative: &str, target: &FileWithMode) -> bool {
+    manifest
+        .integrated
+        .get(relative)
+        .is_some_and(|record| IntegratedFile::of(target).as_ref() == Some(record))
+}
+
+/// Mode after combining two sides that each may have changed it.
+fn merge_mode(lead: Option<u32>, before: Option<u32>, after: Option<u32>) -> Option<Option<u32>> {
+    if after == before || after == lead {
+        Some(lead)
+    } else if lead == before {
+        Some(after)
+    } else {
+        None
+    }
+}
+
+/// Combine a worker edit with a lead edit to the same text file. Returns None
+/// when they conflict, or when either side added, deleted, or holds a binary
+/// or unsupported file, so the caller refuses instead of guessing.
+fn merge_text(
+    dir: &Path,
+    lead: &FileWithMode,
+    before: &FileWithMode,
+    after: &FileWithMode,
+) -> Result<Option<FileWithMode>, String> {
+    let (
+        (FileState::Contents(lead_bytes), lead_mode),
+        (FileState::Contents(before_bytes), before_mode),
+        (FileState::Contents(after_bytes), after_mode),
+    ) = (lead, before, after)
+    else {
+        return Ok(None);
+    };
+    if [lead_bytes, before_bytes, after_bytes]
+        .iter()
+        .any(|bytes| bytes.contains(&0))
+    {
+        return Ok(None);
+    }
+    let Some(mode) = merge_mode(*lead_mode, *before_mode, *after_mode) else {
+        return Ok(None);
+    };
+    let scratch = dir.join("merge");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let paths = [
+            (scratch.join("lead"), lead_bytes),
+            (scratch.join("base"), before_bytes),
+            (scratch.join("worker"), after_bytes),
+        ];
+        for (path, bytes) in &paths {
+            std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+        }
+        let mut cmd = Command::new("git");
+        crate::hide_window_console(&mut cmd);
+        let output = cmd
+            .args(["merge-file", "-p", "-q"])
+            .args(paths.iter().map(|(path, _)| path))
+            .output()
+            .map_err(|e| e.to_string())?;
+        // The exit code is the number of conflicts; negative means failure.
+        match output.status.code() {
+            Some(0) => Ok(Some((FileState::Contents(output.stdout), mode))),
+            Some(1..=127) => Ok(None),
+            _ => Err(format!(
+                "Three-way merge failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+fn git_file_mode(mode: Option<u32>) -> &'static str {
+    match mode {
+        Some(mode) if mode & 0o111 != 0 => "100755",
+        _ => "100644",
+    }
+}
+
+/// One file's section of a git-style patch. Hunks come from `git diff
+/// --no-index`; the headers are rebuilt with the project-relative path.
+fn file_patch(
+    dir: &Path,
+    relative: &str,
+    before: FileWithMode,
+    after: FileWithMode,
+    binary: bool,
+    inexact: bool,
+) -> Result<String, String> {
+    let mut out = format!("diff --git a/{relative} b/{relative}\n");
+    let old_mode = git_file_mode(before.1);
+    let new_mode = git_file_mode(after.1);
+    match (&before.0, &after.0) {
+        (FileState::Missing, _) => out.push_str(&format!("new file mode {new_mode}\n")),
+        (_, FileState::Missing) => out.push_str(&format!("deleted file mode {old_mode}\n")),
+        _ if old_mode != new_mode => {
+            out.push_str(&format!("old mode {old_mode}\nnew mode {new_mode}\n"))
+        }
+        _ => {}
+    }
+    if inexact {
+        out.push_str(
+            "Exact lines unavailable: the file also changed between this session's edits\n",
+        );
+        return Ok(out);
+    }
+    if matches!(before.0, FileState::Skipped) || matches!(after.0, FileState::Skipped) {
+        out.push_str("File too large to diff\n");
+        return Ok(out);
+    }
+    if binary {
+        out.push_str("Binary file changed\n");
+        return Ok(out);
+    }
+    let scratch = dir.join("patch");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let contents = |state: &FileState| match state {
+            FileState::Contents(bytes) => bytes.clone(),
+            FileState::Missing | FileState::Skipped => Vec::new(),
+        };
+        std::fs::write(scratch.join("a"), contents(&before.0)).map_err(|e| e.to_string())?;
+        std::fs::write(scratch.join("b"), contents(&after.0)).map_err(|e| e.to_string())?;
+        let mut cmd = Command::new("git");
+        crate::hide_window_console(&mut cmd);
+        let output = cmd
+            .current_dir(&scratch)
+            .args([
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--no-color",
+                "--text",
+                "-U3",
+                "--",
+                "a",
+                "b",
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(text
+            .find("\n@@")
+            .map(|start| text[start + 1..].to_string())
+            .unwrap_or_default())
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let hunks = result?;
+    if !hunks.is_empty() {
+        let old = if matches!(before.0, FileState::Missing) {
+            "/dev/null".to_string()
+        } else {
+            format!("a/{relative}")
+        };
+        let new = if matches!(after.0, FileState::Missing) {
+            "/dev/null".to_string()
+        } else {
+            format!("b/{relative}")
+        };
+        out.push_str(&format!("--- {old}\n+++ {new}\n{hunks}"));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+/// Append `chunk` if it fits in `max_bytes`, otherwise as many whole lines as
+/// fit. Returns false once anything was left out.
+fn append_capped(patch: &mut String, chunk: &str, max_bytes: usize) -> bool {
+    if patch.len() + chunk.len() <= max_bytes {
+        patch.push_str(chunk);
+        return true;
+    }
+    for line in chunk.split_inclusive('\n') {
+        if patch.len() + line.len() > max_bytes {
+            break;
+        }
+        patch.push_str(line);
+    }
+    false
 }
 
 fn write_state(
@@ -2062,6 +2410,187 @@ mod tests {
             .apply("worker", &from, &to)
             .unwrap_err()
             .contains("not captured"));
+    }
+
+    /// A worker checkout (`source`) and a lead clone (`target`) at one HEAD.
+    fn worker_and_lead(label: &str, files: &[(&str, &str)]) -> Option<(Tmp, Tmp, String, String)> {
+        let source = tmp(&format!("{label}-source"));
+        let target = tmp(&format!("{label}-target"));
+        if !init_git_commit(&source.0, files) {
+            return None;
+        }
+        let from = source.0.to_string_lossy().into_owned();
+        let to = target.0.to_string_lossy().into_owned();
+        if !git(&source.0, &["clone", &from, &to]) {
+            return None;
+        }
+        Some((source, target, from, to))
+    }
+
+    fn edit(store: &CheckpointStore, cwd: &str, root: &Path, path: &str, contents: Option<&str>) {
+        store.prepare("worker", cwd, &[path.into()]).unwrap();
+        match contents {
+            Some(contents) => std::fs::write(root.join(path), contents).unwrap(),
+            None => std::fs::remove_file(root.join(path)).unwrap(),
+        }
+        store.capture("worker", cwd, &[path.into()]).unwrap();
+    }
+
+    const LINES: &str = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+
+    #[test]
+    fn integration_merges_separate_edits_to_one_file_idempotently() {
+        let Some((source, target, from, to)) =
+            worker_and_lead("merge-clean", &[("a.txt", LINES), ("b.txt", "b\n")])
+        else {
+            return;
+        };
+        let (_root, store) = store();
+        store.ensure("worker", &from).unwrap();
+        edit(
+            &store,
+            &from,
+            &source.0,
+            "a.txt",
+            Some(&LINES.replace("1\n", "one\n")),
+        );
+        edit(&store, &from, &source.0, "b.txt", Some("worker b\n"));
+        // The lead commits its own edit meanwhile; only the worker's HEAD is
+        // part of its baseline.
+        std::fs::write(target.0.join("a.txt"), LINES.replace("9\n", "nine\n")).unwrap();
+        assert!(git(&target.0, &["commit", "-am", "lead edit"]));
+
+        let applied = store.apply("worker", &from, &to).unwrap();
+        assert_eq!(applied.files, ["a.txt", "b.txt"]);
+        assert_eq!(applied.merged, ["a.txt"]);
+        assert_eq!(applied.already_applied, 0);
+        let merged = LINES.replace("1\n", "one\n").replace("9\n", "nine\n");
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("a.txt")).unwrap(),
+            merged
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("b.txt")).unwrap(),
+            "worker b\n"
+        );
+
+        let retried = store.apply("worker", &from, &to).unwrap();
+        assert_eq!(retried.already_applied, 2);
+        assert!(retried.merged.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("a.txt")).unwrap(),
+            merged
+        );
+
+        // A partial application left the merge unwritten: retry merges again.
+        std::fs::write(target.0.join("a.txt"), LINES.replace("9\n", "nine\n")).unwrap();
+        assert_eq!(store.apply("worker", &from, &to).unwrap().merged, ["a.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("a.txt")).unwrap(),
+            merged
+        );
+
+        assert!(git(&source.0, &["commit", "-am", "worker commit"]));
+        assert!(store
+            .apply("worker", &from, &to)
+            .unwrap_err()
+            .contains("moved"));
+    }
+
+    #[test]
+    fn integration_refuses_conflicting_or_deleted_edits_without_writing() {
+        let Some((source, target, from, to)) = worker_and_lead(
+            "merge-conflict",
+            &[("a.txt", LINES), ("b.txt", "b\n"), ("c.txt", "c\n")],
+        ) else {
+            return;
+        };
+        let (_root, store) = store();
+        store.ensure("worker", &from).unwrap();
+        edit(
+            &store,
+            &from,
+            &source.0,
+            "a.txt",
+            Some(&LINES.replace("5\n", "worker\n")),
+        );
+        edit(&store, &from, &source.0, "b.txt", Some("worker b\n"));
+        edit(&store, &from, &source.0, "c.txt", None);
+        std::fs::write(target.0.join("a.txt"), LINES.replace("5\n", "lead\n")).unwrap();
+        std::fs::write(target.0.join("c.txt"), "lead c\n").unwrap();
+
+        let error = store.apply("worker", &from, &to).unwrap_err();
+        assert!(error.contains("lead checkout changed"));
+        assert!(error.contains("a.txt, c.txt"));
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("a.txt")).unwrap(),
+            LINES.replace("5\n", "lead\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("b.txt")).unwrap(),
+            "b\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("c.txt")).unwrap(),
+            "lead c\n"
+        );
+        assert!(source.0.join("a.txt").exists());
+    }
+
+    #[test]
+    fn patch_reports_session_changes_with_byte_limit() {
+        let repo = tmp("patch");
+        if !init_git_commit(
+            &repo.0,
+            &[
+                ("a.txt", "1\n2\n3\n"),
+                ("gone.txt", "bye\n"),
+                ("keep.txt", "k\n"),
+            ],
+        ) {
+            return;
+        }
+        std::fs::write(repo.0.join("keep.txt"), "user edit\n").unwrap();
+        let cwd = repo.0.to_string_lossy().into_owned();
+        let (_root, store) = store();
+        store.ensure("worker", &cwd).unwrap();
+        edit(&store, &cwd, &repo.0, "a.txt", Some("1\ntwo\n3\n"));
+        edit(&store, &cwd, &repo.0, "new.txt", Some("fresh\n"));
+        edit(&store, &cwd, &repo.0, "gone.txt", None);
+        edit(&store, &cwd, &repo.0, "image.bin", Some("\0binary"));
+
+        let full = store.patch("worker", &cwd, 1 << 20).unwrap();
+        let names: Vec<_> = full
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect();
+        assert_eq!(names, ["a.txt", "gone.txt", "image.bin", "new.txt"]);
+        assert!(!full.truncated);
+        assert!(full.files[2].binary && !full.files[0].binary);
+        assert_eq!((full.files[0].additions, full.files[0].deletions), (1, 1));
+        assert!(full.patch.starts_with(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n 1\n-2\n+two\n 3\n"
+        ));
+        assert!(full.patch.contains(
+            "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n"
+        ));
+        assert!(full.patch.contains(
+            "diff --git a/image.bin b/image.bin\nnew file mode 100644\nBinary file changed\n"
+        ));
+        assert!(full
+            .patch
+            .contains("--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+fresh\n"));
+        assert!(!full.patch.contains("keep.txt"));
+
+        let none = store.patch("worker", &cwd, 0).unwrap();
+        assert_eq!(none.files, full.files);
+        assert!(none.patch.is_empty() && none.truncated);
+
+        let cut = store.patch("worker", &cwd, 60).unwrap();
+        assert!(cut.truncated);
+        assert_eq!(cut.files.len(), 4);
+        assert!(cut.patch.len() <= 60 && full.patch.starts_with(&cut.patch));
     }
 
     #[test]

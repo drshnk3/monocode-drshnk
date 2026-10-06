@@ -1,15 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_ORCHESTRATION_LIMITS,
   Orchestrator,
+  resolveOrchestrationLimits,
   orchestrationPathKey,
   scopesOverlap,
   visibleUserPrompt,
   workerTurnPrompt,
   type ControlOutcome,
   type OrchestrationHost,
+  type OrchestrationLimits,
   type OrchestrationRun,
+  type OrchestrationRunOptions,
+  REVIEW_PATCH_BYTES,
+  checkFixTurn,
+  validateOrchestrationBudget,
   shellPath,
 } from "./orchestration";
+import { leadResultText } from "./orchestrationReport";
+import { orchestrationUsage } from "./orchestrationSummary";
+import type { CheckRunResult } from "../../../platform/tauri/orchestrationNative";
 import { newSession } from "../../sessions/model/session";
 import type { OrchestrationProposal } from "./orchestrationPlan";
 import { normalizeOrchestrationRun } from "./orchestrationState";
@@ -59,6 +69,19 @@ function setup() {
       };
     }),
     integrateWorker: vi.fn(async () => ({ files: [], alreadyApplied: 0 })),
+    runCheck: vi.fn(async () => ({
+      exitCode: 0,
+      output: "ok",
+      timedOut: false,
+      durationMs: 5,
+    })),
+    workerDiff: vi.fn(async () => ({
+      files: [
+        { relative: "a/file.ts", status: "modified", additions: 2, deletions: 1 },
+      ],
+      patch: "diff --git a/a/file.ts b/a/file.ts\n",
+      truncated: false,
+    })),
     cleanupWorker: vi.fn(async () => true),
     submit: vi.fn((id, _text, done) => {
       const session = sessions.find((session) => session.id === id)!;
@@ -83,9 +106,20 @@ function setup() {
     input: Record<string, unknown> = {},
     id = `request-${++request}`,
   ) => manager.handle("lead", id, action, input);
-  const start = async () => {
+  const start = async (
+    limits?: Partial<OrchestrationLimits>,
+    maxWorkers = 2,
+    options?: OrchestrationRunOptions,
+  ) => {
     lead.busy = false;
-    await manager.start("lead", ["codex"], 2);
+    await manager.start(
+      "lead",
+      ["codex"],
+      maxWorkers,
+      undefined,
+      limits,
+      options,
+    );
     lead.busy = true;
   };
   const delegate = (files: string[], extra = {}) =>
@@ -253,6 +287,53 @@ describe("local orchestration", () => {
     expect(
       vi.mocked(f.host.submit).mock.calls.find(([id]) => id === "lead")?.[1],
     ).toContain('"modelSettings":{"reasoningEffort":"xhigh"}');
+  });
+  it("carries approved checks, reviewers and run options into the run", async () => {
+    const f = setup();
+    f.lead.busy = false;
+    const card = proposal();
+    card.settings.autoAccept = true;
+    card.tasks[1].checks = ["npm test"];
+    card.tasks.push({
+      id: "review",
+      title: "Review types",
+      prompt: "Check the type design",
+      harness: "codex",
+      model: "codex:test",
+      files: [],
+      dependsOn: [],
+      kind: "review",
+      reviewOf: ["types"],
+    });
+    await expect(
+      f.manager.startApproved("lead", "card", card, undefined, {
+        budget: { maxMinutes: 0 },
+      }),
+    ).rejects.toThrow("maxMinutes");
+    expect(f.manager.run("lead")).toBeUndefined();
+
+    await f.manager.startApproved("lead", "card", card, undefined, {
+      budget: { maxWorkerTurns: 10 },
+    });
+    const [ui, types, reviewer] = f.tasks();
+    expect(types.checks).toEqual(["npm test"]);
+    expect(reviewer).toMatchObject({
+      kind: "review",
+      reviewOf: [types.id],
+      scopes: [],
+      status: "queued",
+    });
+    expect(ui.kind).toBeUndefined();
+    expect(f.manager.run("lead")).toMatchObject({
+      autoAccept: true,
+      budget: { maxWorkerTurns: 10 },
+      activeMs: 0,
+    });
+    const leadPrompt = String(
+      vi.mocked(f.host.submit).mock.calls.find(([id]) => id === "lead")?.[1],
+    );
+    expect(leadPrompt).toContain('"checks":["npm test"]');
+    expect(leadPrompt).toContain(`"reviewOf":["${types.id}"]`);
   });
   it("names the conversation that blocks a paused run from resuming", async () => {
     const f = setup();
@@ -1067,7 +1148,7 @@ describe("local orchestration", () => {
   });
   it("returns worker output to an idle lead once", async () => {
     const f = setup();
-    await f.start();
+    await f.start({ wakeBatchMs: 0 });
     await f.delegate(["a"]);
     await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(1));
     f.lead.busy = false;
@@ -1083,7 +1164,7 @@ describe("local orchestration", () => {
   });
   it("keeps results available and pauses when the lead cannot continue", async () => {
     const f = setup();
-    await f.start();
+    await f.start({ wakeBatchMs: 0 });
     await f.delegate(["a"]);
     await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(1));
     f.lead.busy = false;
@@ -1439,5 +1520,1182 @@ describe("local orchestration", () => {
     });
     expect(f.manager.submissionError("other")).toContain("active orchestrator");
     expect(f.manager.submissionError("lead")).toBeNull();
+  });
+});
+
+const leadCalls = (f: ReturnType<typeof setup>) =>
+  vi.mocked(f.host.submit).mock.calls.filter(([id]) => id === "lead");
+const workerOf = (f: ReturnType<typeof setup>, sessionId: string) =>
+  f.sessions.find((session) => session.id === sessionId)!;
+const reportBlock = (value: Record<string, unknown>) =>
+  `<monocode_result>${JSON.stringify(value)}</monocode_result>`;
+
+describe("structured worker results", () => {
+  it("stores the report and actual changes, and gives the lead the compact form", async () => {
+    const f = setup();
+    f.host.workerChanges = vi.fn(async () => [
+      { relative: "a/file.ts", status: "modified", additions: 3, deletions: 1 },
+      { relative: "a/extra.ts", status: "added", additions: 5, deletions: 0 },
+    ]);
+    await f.start({ wakeBatchMs: 0 });
+    await f.delegate(["a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    f.lead.busy = false;
+    f.completions.get(task.sessionId)!({
+      status: "completed",
+      text: `Implemented the helper.\n\n${reportBlock({
+        status: "done",
+        summary: "Added the helper",
+        changedFiles: ["a/file.ts"],
+        checks: [{ command: "npm test", passed: true }],
+        blockers: [],
+      })}`,
+    });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.tasks()[0]).toMatchObject({
+      result: "Implemented the helper.",
+      report: {
+        status: "done",
+        summary: "Added the helper",
+        changedFiles: ["a/file.ts"],
+        checks: [{ command: "npm test", passed: true }],
+        blockers: [],
+      },
+      changes: [
+        { relative: "a/file.ts", status: "modified", additions: 3, deletions: 1 },
+        { relative: "a/extra.ts", status: "added", additions: 5, deletions: 0 },
+      ],
+    });
+    expect(f.host.workerChanges).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: task.id }),
+    );
+    expect(f.manager.run("lead")?.dispatches?.[0].result).toBe(
+      "Implemented the helper.",
+    );
+
+    await vi.waitFor(() => expect(leadCalls(f)).toHaveLength(1));
+    const body = String(leadCalls(f)[0][1]);
+    expect(body).toContain("Report (done): Added the helper");
+    expect(body).toContain("a/extra.ts (added +5/-0)");
+    expect(body).toContain("changed but not reported: a/extra.ts");
+    expect(body).toContain("diff");
+    expect(body).not.toContain("<monocode_result>");
+
+    const view = (await f.call("get", { taskId: task.id })) as {
+      result?: string;
+      report?: { summary: string };
+      changeMismatch?: string;
+    };
+    expect(view.result).toBeUndefined();
+    expect(view.report?.summary).toBe("Added the helper");
+    expect(view.changeMismatch).toContain("a/extra.ts");
+    const listed = (await f.call("list")) as {
+      run: {
+        tasks: { result?: string; report?: unknown }[];
+        dispatches: { result?: string }[];
+      };
+    };
+    expect(listed.run.tasks[0].result).toBeUndefined();
+    expect(listed.run.tasks[0].report).toBeDefined();
+    expect(listed.run.dispatches[0].result).toBeUndefined();
+  });
+
+  it("settles normally without a report or readable changes", async () => {
+    const f = setup();
+    f.host.workerChanges = vi.fn(async () => {
+      throw new Error("checkpoint unavailable");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await f.start({ wakeBatchMs: 0, leadResultChars: 200 });
+    await f.delegate(["a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    f.lead.busy = false;
+    const text = `${"x".repeat(1000)} Tests pass`;
+    f.completions.get(task.sessionId)!({ status: "completed", text });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.tasks()[0]).toMatchObject({ result: text });
+    expect(f.tasks()[0].report).toBeUndefined();
+    expect(f.tasks()[0].changes).toBeUndefined();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+
+    await vi.waitFor(() => expect(leadCalls(f)).toHaveLength(1));
+    const body = String(leadCalls(f)[0][1]);
+    expect(body).toContain("No structured report");
+    expect(body).toContain("Tests pass");
+    expect(body).not.toContain("x".repeat(201));
+    const view = (await f.call("get", { taskId: task.id })) as {
+      result: string;
+    };
+    expect(view.result).toHaveLength(200);
+  });
+
+  it("clears the previous report when a task gets a new turn", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    f.completions.get(task.sessionId)!({
+      status: "completed",
+      text: reportBlock({ status: "partial", summary: "Half done" }),
+    });
+    await vi.waitFor(() => expect(f.tasks()[0].report).toBeDefined());
+    await f.call("message", { taskId: task.id, text: "Finish the rest" });
+    expect(f.tasks()[0].report).toBeUndefined();
+    await f.manager.stopRun("lead");
+  });
+});
+
+describe("diff action", () => {
+  it("returns a worker's patch with clamped size and explains when there is none", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["a"]);
+    await f.delegate(["a/file.ts"]);
+    await vi.waitFor(() =>
+      expect(f.tasks()[0].workspace?.checkoutCwd).toBeDefined(),
+    );
+    const [running, queued] = f.tasks();
+    await expect(f.call("diff", { taskId: queued.id })).rejects.toThrow(
+      "has not started yet",
+    );
+    await expect(
+      f.call("diff", { taskId: running.id, bytes: 10 }),
+    ).rejects.toThrow("Unknown diff field: bytes. diff accepts: taskId, maxBytes.");
+    await expect(
+      f.call("diff", { taskId: running.id, maxBytes: "big" }),
+    ).rejects.toThrow("maxBytes must be a number of bytes from 1000 to 200000");
+
+    expect(await f.call("diff", { taskId: running.id })).toEqual({
+      taskId: running.id,
+      files: [
+        { relative: "a/file.ts", status: "modified", additions: 2, deletions: 1 },
+      ],
+      patch: "diff --git a/a/file.ts b/a/file.ts\n",
+      truncated: false,
+    });
+    expect(f.host.workerDiff).toHaveBeenLastCalledWith(
+      expect.objectContaining({ leadId: "lead" }),
+      expect.objectContaining({ id: running.id }),
+      60_000,
+    );
+    await f.call("diff", { taskId: running.id, maxBytes: 10 });
+    expect(vi.mocked(f.host.workerDiff).mock.lastCall?.[2]).toBe(1000);
+    await f.call("diff", { taskId: running.id, maxBytes: 10_000_000 });
+    expect(vi.mocked(f.host.workerDiff).mock.lastCall?.[2]).toBe(200_000);
+
+    vi.mocked(f.host.workerDiff).mockRejectedValueOnce(
+      new Error("checkpoint missing"),
+    );
+    await expect(f.call("diff", { taskId: running.id })).rejects.toThrow(
+      /Could not read Task's changes: checkpoint missing\. Retry diff/,
+    );
+    // Inspection is never receipted, so it cannot exhaust the command limit.
+    expect(Object.keys(f.manager.run("lead")!.requests)).toHaveLength(2);
+
+    f.completions.get(running.sessionId)!({ status: "completed", text: "Done" });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    await f.call("review", { taskId: running.id });
+    await expect(f.call("diff", { taskId: running.id })).rejects.toThrow(
+      "already accepted and its worktree cleaned up",
+    );
+    await f.manager.stopRun("lead");
+  });
+
+  it("stays readable after the run stops and is named in the lead envelope", async () => {
+    const f = setup();
+    // A dirty worktree is retained when the run stops.
+    vi.mocked(f.host.cleanupWorker).mockResolvedValue(false);
+    await f.start();
+    const envelope = f.manager.prompt("lead", "Build it");
+    expect(envelope).toContain("Review with diff before review/accept");
+    expect(envelope).toContain("end your turn instead of polling");
+    await f.delegate(["a"]);
+    await vi.waitFor(() =>
+      expect(f.tasks()[0].workspace?.checkoutCwd).toBeDefined(),
+    );
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: "Done",
+    });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    await f.manager.stopRun("lead");
+    await expect(
+      f.call("diff", { taskId: f.tasks()[0].id }),
+    ).resolves.toMatchObject({ taskId: f.tasks()[0].id });
+  });
+});
+
+describe("lead wake-ups", () => {
+  it("coalesces completions inside the batching window into one continuation", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    await f.start(undefined, 3);
+    await f.delegate(["a"]);
+    await f.delegate(["b"]);
+    await f.delegate(["c"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(3));
+    f.lead.busy = false;
+    for (const task of f.tasks()) {
+      f.completions.get(task.sessionId)!({
+        status: "completed",
+        text: `Finished ${task.files[0]}`,
+      });
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    expect(f.tasks().every((task) => task.status === "completed")).toBe(true);
+    expect(leadCalls(f)).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(600);
+    expect(leadCalls(f)).toHaveLength(1);
+    const body = String(leadCalls(f)[0][1]);
+    for (const file of ["a", "b", "c"]) expect(body).toContain(`Finished ${file}`);
+    expect(f.manager.run("lead")?.continuations).toBe(1);
+
+    f.manager.sync();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(leadCalls(f)).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("puts review verdicts beside the reviewed work and reports run usage", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    await f.start(undefined, 3, { budget: { maxMinutes: 60 } });
+    await f.delegate(["a"], { title: "Parser" });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const work = f.tasks()[0];
+    await f.call("delegate", {
+      title: "Parser review",
+      harness: "codex",
+      kind: "review",
+      reviewOf: [work.id],
+    });
+    f.completions.get(work.sessionId)!({ status: "completed", text: doneReport() });
+    await vi.waitFor(() => expect(f.tasks()[1].status).toBe("running"));
+    expect(promptsTo(f, f.tasks()[1].sessionId)[0]).toContain(
+      "Review the changes of the listed tasks.",
+    );
+    f.completions.get(f.tasks()[1].sessionId)!({
+      status: "completed",
+      text: doneReport(),
+    });
+    await vi.waitFor(() => expect(f.tasks()[1].status).toBe("completed"));
+    f.lead.busy = false;
+    f.manager.sync();
+    await vi.advanceTimersByTimeAsync(2100);
+
+    expect(leadCalls(f)).toHaveLength(1);
+    const body = String(leadCalls(f)[0][1]);
+    const verdict = `Review ${f.tasks()[1].id} — Parser review: approved`;
+    expect(body).toContain(`${work.id} — Parser: completed`);
+    expect(body.indexOf(verdict)).toBeGreaterThan(body.indexOf(`${work.id} — Parser`));
+    expect(body.indexOf(verdict)).toBeLessThan(
+      body.indexOf(`${f.tasks()[1].id} — Parser review: completed (review: approved)`),
+    );
+    expect(body).toMatch(/Run usage: \d+s elapsed, 2 worker turns, \d+s worker time; budget 60 minutes\./);
+  });
+
+  it("wakes the lead promptly when a worker needs input, with results so far", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    await f.start();
+    await f.delegate(["a"]);
+    await f.delegate(["b"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    f.lead.busy = false;
+    const [first, second] = f.tasks();
+    f.completions.get(first.sessionId)!({
+      status: "completed",
+      text: "First done",
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(f.tasks()[0].status).toBe("completed");
+    expect(leadCalls(f)).toHaveLength(0);
+
+    workerOf(f, second.sessionId).blocks = [
+      {
+        id: "ask",
+        role: "approval",
+        text: "Run the check",
+        approval: { requestId: 7 },
+      },
+    ];
+    f.manager.sync();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(leadCalls(f)).toHaveLength(1);
+    const body = String(leadCalls(f)[0][1]);
+    expect(body).toContain("First done");
+    expect(body).toContain("requestId 7");
+    expect(vi.getTimerCount()).toBe(0);
+    await f.manager.stopRun("lead");
+  });
+
+  it("wakes a lead that was busy as soon as its turn ends once the window has passed", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    await f.start();
+    await f.delegate(["a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(1));
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: "Done while busy",
+    });
+    await vi.advanceTimersByTimeAsync(3000);
+    // The lead is mid-turn, so nothing was scheduled or sent.
+    expect(leadCalls(f)).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    f.lead.busy = false;
+    f.manager.sync();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(leadCalls(f)).toHaveLength(1);
+  });
+
+  it("drops a pending wake-up when the run stops", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    await f.start();
+    await f.delegate(["a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(1));
+    f.lead.busy = false;
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: "Done",
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(vi.getTimerCount()).toBe(1);
+    await f.manager.stopRun("lead");
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(leadCalls(f)).toHaveLength(0);
+  });
+
+  it("pauses at the configured continuation limit", async () => {
+    const f = setup();
+    await f.start({ wakeBatchMs: 0, maxContinuations: 1 });
+    await f.delegate(["a"]);
+    await f.delegate(["b"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    f.lead.busy = false;
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: "One",
+    });
+    await vi.waitFor(() => expect(leadCalls(f)).toHaveLength(1));
+    f.completions.get("lead")!({ status: "completed", text: "" });
+    f.completions.get(f.tasks()[1].sessionId)!({
+      status: "completed",
+      text: "Two",
+    });
+    await vi.waitFor(() =>
+      expect(f.manager.run("lead")?.status).toBe("paused"),
+    );
+    expect(f.manager.run("lead")?.error).toContain("continuation limit");
+    expect(leadCalls(f)).toHaveLength(1);
+  });
+});
+
+describe("shared run brief", () => {
+  it("puts the brief first, identically for every worker, and hides it from the transcript", () => {
+    const brief = "Use pnpm. Components live in src/ui.";
+    const first = workerTurnPrompt("Build the form.", ["src/form"], undefined, brief);
+    const second = workerTurnPrompt("Write the API.", ["src/api"], "/tmp/s", brief);
+    const prefix = first.slice(0, first.indexOf("Build the form."));
+    expect(prefix.startsWith("<monocode_brief>")).toBe(true);
+    expect(prefix).toContain(brief);
+    expect(second.startsWith(prefix)).toBe(true);
+    expect(first.indexOf("Build the form.")).toBeLessThan(
+      first.indexOf("<monocode_assignment>"),
+    );
+    expect(first).toContain("<monocode_result>");
+    expect(visibleUserPrompt(first)).toBe("Build the form.");
+    expect(workerTurnPrompt("Task", ["a"]).startsWith("Task")).toBe(true);
+  });
+
+  it("carries the approved brief onto the run and into worker prompts", async () => {
+    const f = setup();
+    f.lead.busy = false;
+    const brief = "Conventions: tabs. Key file: src/app.ts.";
+    await f.manager.startApproved("lead", "card", {
+      version: 1,
+      leadId: "lead",
+      cwd: "/repo",
+      request: "Build settings",
+      author: { harness: "claude", model: "claude:test", name: "Lead" },
+      settings: {
+        choices: [{ harness: "codex", model: "codex:test", name: "Test" }],
+        maxWorkers: 2,
+      },
+      status: "ready",
+      title: "Settings",
+      summary: "Split the work",
+      brief,
+      tasks: [
+        {
+          id: "ui",
+          title: "UI",
+          prompt: "Build the UI",
+          harness: "codex",
+          model: "codex:test",
+          files: ["src/ui"],
+          dependsOn: [],
+        },
+      ],
+    });
+    expect(f.manager.run("lead")?.brief).toBe(brief);
+    expect(f.saved.get("lead")?.brief).toBe(brief);
+    await vi.waitFor(() =>
+      expect(
+        vi.mocked(f.host.submit).mock.calls.some(([id]) => id !== "lead"),
+      ).toBe(true),
+    );
+    const sent = String(
+      vi.mocked(f.host.submit).mock.calls.find(([id]) => id !== "lead")![1],
+    );
+    expect(sent.startsWith("<monocode_brief>")).toBe(true);
+    expect(sent).toContain(brief);
+    expect(visibleUserPrompt(sent)).toBe("Build the UI");
+    const listed = (await f.call("list")) as { run: { brief?: string } };
+    expect(listed.run.brief).toBeUndefined();
+    await f.manager.stopRun("lead");
+  });
+});
+
+describe("orchestration limits", () => {
+  it("defaults to the previous fixed caps and clamps overrides to their ranges", () => {
+    expect(DEFAULT_ORCHESTRATION_LIMITS).toEqual({
+      maxWorkers: 4,
+      maxTasks: 40,
+      maxCommands: 512,
+      maxContinuations: 20,
+      storedResultChars: 20_000,
+      leadResultChars: 4000,
+      wakeBatchMs: 2000,
+      checkTimeoutMs: 600_000,
+      maxCheckRetries: 2,
+    });
+    expect(
+      resolveOrchestrationLimits({
+        maxWorkers: 20,
+        maxTasks: 0,
+        wakeBatchMs: Number.NaN,
+      }),
+    ).toMatchObject({ maxWorkers: 8, maxTasks: 1, wakeBatchMs: 2000 });
+  });
+
+  it("loads a run saved before limits and briefs existed with the defaults", async () => {
+    const f = setup();
+    await f.start();
+    await f.manager.stopRun("lead");
+    const legacy = structuredClone(f.saved.get("lead")!);
+    delete legacy.limits;
+    delete legacy.brief;
+    f.saved.set("lead", legacy);
+    const restored = new Orchestrator(f.store);
+    restored.bind(f.host);
+    await restored.hydrate("lead");
+    expect(restored.run("lead")?.limits).toEqual(DEFAULT_ORCHESTRATION_LIMITS);
+    expect(restored.run("lead")?.brief).toBeUndefined();
+  });
+
+  it("enforces configured task, worker and stored-result limits", async () => {
+    const f = setup();
+    await expect(f.start(undefined, 5)).rejects.toThrow("Choose 1 to 4 workers");
+    await f.start({ maxWorkers: 6, maxTasks: 1, storedResultChars: 1000 }, 5);
+    expect(f.manager.run("lead")?.maxWorkers).toBe(5);
+    await f.delegate(["a"]);
+    await expect(f.delegate(["b"])).rejects.toThrow(
+      "This run has reached its 1-task limit",
+    );
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: "y".repeat(5000),
+    });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.tasks()[0].result).toHaveLength(1000);
+    await f.manager.stopRun("lead");
+  });
+});
+
+const doneReport = (status = "done") =>
+  `Finished.\n<monocode_result>{"status":"${status}","summary":"Implemented it","changedFiles":["src/a/file.ts"],"checks":[],"blockers":[]}</monocode_result>`;
+const failedCheck = (output = "FAIL src/a/file.test.ts"): CheckRunResult => ({
+  exitCode: 1,
+  output,
+  timedOut: false,
+  durationMs: 40,
+});
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+/** Prompts the host sent to one session, in order. */
+const promptsTo = (f: ReturnType<typeof setup>, id: string) =>
+  vi
+    .mocked(f.host.submit)
+    .mock.calls.filter(([target]) => target === id)
+    .map(([, text]) => String(text));
+
+describe("app-run acceptance checks", () => {
+  it("runs the checks in the worker's checkout before the result is reviewable", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"], { checks: ["npm test", "npx tsc --noEmit"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    const pending = deferred<CheckRunResult>();
+    vi.mocked(f.host.runCheck).mockReturnValueOnce(pending.promise);
+    f.completions.get(task.sessionId)!({ status: "completed", text: doneReport() });
+
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("checking"));
+    expect(f.tasks()[0]).toMatchObject({
+      delivered: true,
+      activeDispatchId: undefined,
+      lastDispatchId: task.activeDispatchId,
+    });
+    await expect(f.call("review", { taskId: task.id })).rejects.toThrow(
+      "acceptance checks",
+    );
+    await expect(
+      f.call("message", { taskId: task.id, text: "More" }),
+    ).rejects.toThrow("is checking");
+    pending.resolve({ exitCode: 0, output: "ok", timedOut: false, durationMs: 9 });
+
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.host.runCheck).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({ id: task.id }),
+      "npm test",
+    );
+    expect(f.host.runCheck).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "npx tsc --noEmit",
+    );
+    expect(f.tasks()[0]).toMatchObject({
+      delivered: false,
+      accepted: false,
+      checkResults: [
+        { command: "npm test", passed: true, exitCode: 0, durationMs: 9 },
+        { command: "npx tsc --noEmit", passed: true },
+      ],
+    });
+    expect(leadResultText(f.tasks()[0], 4000)).toContain(
+      "App-run checks: passed `npm test` (0s); passed `npx tsc --noEmit` (0s)",
+    );
+    expect(f.host.submit).toHaveBeenCalledOnce();
+  });
+
+  it("sends failing output back to the worker and completes once the checks pass", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    vi.mocked(f.host.runCheck).mockResolvedValueOnce(
+      failedCheck("expected 2, received 3"),
+    );
+    f.completions.get(task.sessionId)!({ status: "completed", text: doneReport() });
+
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    const fix = promptsTo(f, task.sessionId)[1];
+    expect(fix).toContain("automatic fix attempt 1 of 2");
+    expect(fix).toContain("`npm test` exited with 1");
+    expect(fix).toContain("expected 2, received 3");
+    expect(fix).toContain("<monocode_assignment>");
+    expect(f.tasks()[0]).toMatchObject({
+      status: "running",
+      checkRetries: 1,
+      delivered: true,
+      prompt: "Implement the bounded change",
+    });
+    expect(f.tasks()[0].workspace?.checkoutCwd).toBe(`/worktrees/${task.id}`);
+
+    f.completions.get(task.sessionId)!({ status: "completed", text: doneReport() });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.tasks()[0]).toMatchObject({
+      checkRetries: 1,
+      turns: 2,
+      delivered: false,
+      checkResults: [{ command: "npm test", passed: true }],
+    });
+    expect(leadResultText(f.tasks()[0], 4000)).toContain(
+      "App-run checks after 1 automatic fix turn: passed `npm test`",
+    );
+  });
+
+  it("hands failing checks to the lead once automatic fixes run out", async () => {
+    const f = setup();
+    await f.start({ maxCheckRetries: 1 });
+    await f.delegate(["src/a"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    vi.mocked(f.host.runCheck).mockResolvedValue(failedCheck("still red"));
+    f.completions.get(task.sessionId)!({ status: "completed", text: doneReport() });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    f.completions.get(task.sessionId)!({ status: "completed", text: doneReport() });
+
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.host.submit).toHaveBeenCalledTimes(2);
+    expect(f.tasks()[0]).toMatchObject({
+      checkRetries: 1,
+      delivered: false,
+      accepted: false,
+      checkResults: [{ passed: false, exitCode: 1, outputTail: "still red" }],
+    });
+    const text = leadResultText(f.tasks()[0], 4000);
+    expect(text).toContain("FAILED `npm test` (exit 1, 0s)");
+    expect(text).toContain("Output of `npm test`:\nstill red");
+    const listed = (await f.call("list")) as {
+      run: { tasks: { checkResults: { outputTail?: string }[] }[] };
+    };
+    expect(listed.run.tasks[0].checkResults[0].outputTail).toBe("still red");
+  });
+
+  it("does not run checks for a worker that reports itself blocked", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: doneReport("blocked"),
+    });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.host.runCheck).not.toHaveBeenCalled();
+    expect(f.tasks()[0].delivered).toBe(false);
+  });
+
+  it("drops a check result that arrives after its task was cancelled and redone", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    const late = deferred<CheckRunResult>();
+    vi.mocked(f.host.runCheck).mockReturnValueOnce(late.promise);
+    const firstTurn = f.completions.get(task.sessionId)!;
+    firstTurn({ status: "completed", text: doneReport() });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("checking"));
+
+    await f.call("cancel", { taskId: task.id });
+    expect(f.tasks()[0]).toMatchObject({
+      status: "cancelled",
+      checkRunId: undefined,
+    });
+    await f.call("message", { taskId: task.id, text: "Try again" });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    // The first turn's settlement is stale too: a newer dispatch owns the task.
+    firstTurn({ status: "completed", text: "Stale" });
+    f.completions.get(task.sessionId)!({ status: "completed", text: doneReport() });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    late.resolve(failedCheck());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(f.tasks()[0]).toMatchObject({
+      status: "completed",
+      checkResults: [{ command: "npm test", passed: true }],
+      checkRetries: undefined,
+    });
+    expect(f.host.submit).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels in-flight checks when the run stops", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"], { checks: ["npm test", "npm run lint"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const pending = deferred<CheckRunResult>();
+    vi.mocked(f.host.runCheck).mockReturnValueOnce(pending.promise);
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: doneReport(),
+    });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("checking"));
+
+    await f.manager.stopRun("lead");
+    expect(f.tasks()[0].status).toBe("cancelled");
+    pending.resolve(failedCheck());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(f.tasks()[0].status).toBe("cancelled");
+    expect(f.tasks()[0].checkResults).toBeUndefined();
+    expect(f.host.runCheck).toHaveBeenCalledOnce();
+  });
+
+  it("re-runs checks interrupted by a pause or restart when the run resumes", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    vi.mocked(f.host.runCheck).mockReturnValueOnce(new Promise(() => {}));
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: doneReport(),
+    });
+    await vi.waitFor(() =>
+      expect(f.saved.get("lead")?.tasks[0].status).toBe("checking"),
+    );
+
+    const restored = new Orchestrator(f.store);
+    restored.bind(f.host);
+    await restored.hydrate("lead");
+    expect(restored.run("lead")?.status).toBe("paused");
+    expect(restored.run("lead")?.tasks[0]).toMatchObject({
+      status: "interrupted",
+      recheck: true,
+      delivered: true,
+      recoveryPrompt: undefined,
+    });
+    expect(restored.run("lead")?.tasks[0].error).toContain(
+      "Acceptance checks were interrupted",
+    );
+    expect(restored.run("lead")?.dispatches?.[0].state).toBe("completed");
+
+    f.lead.busy = false;
+    await restored.start("lead", ["codex"], 2);
+    await vi.waitFor(() =>
+      expect(restored.run("lead")?.tasks[0].status).toBe("completed"),
+    );
+    expect(f.host.runCheck).toHaveBeenCalledTimes(2);
+    // Resume re-ran the checks; it did not send the worker another turn.
+    expect(f.host.submit).toHaveBeenCalledOnce();
+    expect(restored.run("lead")?.tasks[0]).toMatchObject({
+      recheck: undefined,
+      delivered: false,
+      checkResults: [{ passed: true }],
+    });
+  });
+
+  it("reports a check the app could not run to the lead without a fix turn", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"], { checks: ["npm test", "npm run lint"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    vi.mocked(f.host.runCheck).mockRejectedValueOnce(
+      new Error("checkout missing"),
+    );
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: doneReport(),
+    });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.host.runCheck).toHaveBeenCalledOnce();
+    expect(f.host.submit).toHaveBeenCalledOnce();
+    expect(f.tasks()[0].error).toContain(
+      "Its acceptance checks could not run: checkout missing",
+    );
+    expect(f.tasks()[0].checkResults?.[0]).toMatchObject({
+      passed: false,
+      exitCode: null,
+    });
+  });
+
+  it("builds the fix turn from each failing command and its output tail", () => {
+    const turn = checkFixTurn(
+      [
+        { ...failedCheck(), command: "a", passed: false, exitCode: 2, outputTail: "x".repeat(5000) },
+        { command: "b", passed: false, exitCode: null, timedOut: true, durationMs: 1, outputTail: "" },
+      ],
+      2,
+      2,
+    );
+    expect(turn).toContain("2 failed");
+    expect(turn).toContain("attempt 2 of 2");
+    expect(turn).toContain("`a` exited with 2");
+    expect(turn).toContain("`b` timed out.");
+    expect(turn).not.toContain("x".repeat(3001));
+    expect(turn).toContain("Do not weaken, skip or delete tests");
+  });
+});
+
+describe("automatic acceptance", () => {
+  it("integrates a task whose checks pass and lets its dependents start", async () => {
+    const f = setup();
+    await f.start(undefined, 2, { autoAccept: true });
+    expect(f.manager.prompt("lead", "Go")).toContain("This run auto-accepts");
+    await f.delegate(["src/types"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const upstream = f.tasks()[0];
+    await f.delegate(["src/ui"], { dependsOn: [upstream.id] });
+    f.completions.get(upstream.sessionId)!({
+      status: "completed",
+      text: doneReport(),
+    });
+
+    await vi.waitFor(() => expect(f.tasks()[1].status).toBe("running"));
+    expect(f.tasks()[0]).toMatchObject({
+      status: "completed",
+      accepted: true,
+      autoAccepted: true,
+      delivered: false,
+      workspace: undefined,
+    });
+    expect(f.host.integrateWorker).toHaveBeenCalledOnce();
+    expect(f.host.cleanupWorker).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: upstream.id }),
+      false,
+    );
+    expect(leadResultText(f.tasks()[0], 4000)).toContain("Auto-accepted");
+  });
+
+  it("leaves a task for the lead when automatic integration fails", async () => {
+    const f = setup();
+    await f.start(undefined, 2, { autoAccept: true });
+    await f.delegate(["src/a"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    vi.mocked(f.host.integrateWorker).mockRejectedValueOnce(
+      new Error("src/a/file.ts conflicts with the lead checkout"),
+    );
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: doneReport(),
+    });
+
+    await vi.waitFor(() =>
+      expect(f.tasks()[0].autoAcceptError).toContain("conflicts"),
+    );
+    await vi.waitFor(() => expect(f.tasks()[0].delivered).toBe(false));
+    expect(f.tasks()[0]).toMatchObject({ status: "completed", accepted: false });
+    expect(f.tasks()[0].autoAccepted).toBeUndefined();
+    expect(f.tasks()[0].workspace?.checkoutCwd).toContain("/worktrees/");
+    expect(leadResultText(f.tasks()[0], 4000)).toContain(
+      "Auto-accept failed: src/a/file.ts conflicts with the lead checkout",
+    );
+    await f.call("review", { taskId: f.tasks()[0].id });
+    expect(f.tasks()[0].accepted).toBe(true);
+  });
+
+  it("never auto-accepts work without checks, or work reported partial", async () => {
+    const f = setup();
+    await f.start(undefined, 2, { autoAccept: true });
+    await f.delegate(["src/a"]);
+    await f.delegate(["src/b"], { checks: ["npm test"] });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: doneReport(),
+    });
+    f.completions.get(f.tasks()[1].sessionId)!({
+      status: "completed",
+      text: doneReport("partial"),
+    });
+    await vi.waitFor(() =>
+      expect(f.tasks().map((task) => task.status)).toEqual([
+        "completed",
+        "completed",
+      ]),
+    );
+    await vi.waitFor(() => expect(f.tasks()[1].checkResults).toHaveLength(1));
+    expect(f.tasks().map((task) => task.accepted)).toEqual([false, false]);
+    expect(f.host.integrateWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe("review tasks", () => {
+  const review = (
+    f: ReturnType<typeof setup>,
+    reviewOf: string[],
+    extra: Record<string, unknown> = {},
+  ) =>
+    f.call("delegate", {
+      title: "Review",
+      prompt: "Focus on error handling",
+      harness: "codex",
+      kind: "review",
+      reviewOf,
+      ...extra,
+    });
+
+  it("validates review and check fields on delegate", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"]);
+    const work = f.tasks()[0].id;
+    await expect(review(f, [work], { files: ["src"] })).rejects.toThrow(
+      "A review task has no write scope",
+    );
+    await expect(review(f, [])).rejects.toThrow("needs reviewOf");
+    await expect(review(f, ["missing"])).rejects.toThrow(
+      "reviewOf must hold work taskIds",
+    );
+    await expect(review(f, [work], { checks: ["npm test"] })).rejects.toThrow(
+      "cannot have checks",
+    );
+    await expect(review(f, [work], { kind: "audit" })).rejects.toThrow(
+      'kind must be "work" or "review"',
+    );
+    await expect(f.delegate(["src/b"], { reviewOf: [work] })).rejects.toThrow(
+      "reviewOf is only for review tasks",
+    );
+    await expect(
+      f.delegate(["src/b"], { checks: Array(6).fill("npm test") }),
+    ).rejects.toThrow("at most 5");
+    await expect(f.delegate(["src/b"], { checks: [" "] })).rejects.toThrow(
+      "non-empty",
+    );
+    await expect(
+      f.delegate(["src/b"], { checks: ["x".repeat(501)] }),
+    ).rejects.toThrow("under 500 characters");
+    await review(f, [work], { files: [] });
+    const reviewer = f.tasks()[1];
+    expect(reviewer).toMatchObject({
+      kind: "review",
+      reviewOf: [work],
+      files: [],
+      scopes: [],
+      workspacePolicy: "isolated-child",
+    });
+    await expect(review(f, [reviewer.id])).rejects.toThrow(
+      "reviewOf must hold work taskIds",
+    );
+    expect(f.store.scopes).not.toHaveBeenCalledWith(expect.anything(), []);
+  });
+
+  it("starts a reviewer once its tasks complete, without waiting for acceptance", async () => {
+    const f = setup();
+    await f.start(undefined, 3);
+    await f.delegate(["src/a"], { title: "Parser" });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const work = f.tasks()[0];
+    await review(f, [work.id]);
+    const reviewer = f.tasks()[1];
+    const listed = (await f.call("list")) as {
+      run: { tasks: { waitingFor?: string }[] };
+    };
+    expect(listed.run.tasks[1].waitingFor).toBe(
+      "Waiting for Parser to complete",
+    );
+    expect(f.tasks()[1].status).toBe("queued");
+
+    f.completions.get(work.sessionId)!({ status: "completed", text: doneReport() });
+    await vi.waitFor(() => expect(f.tasks()[1].status).toBe("running"));
+    expect(f.tasks()[0].accepted).toBe(false);
+    expect(f.host.workerDiff).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: work.id }),
+      REVIEW_PATCH_BYTES,
+    );
+    const prompt = promptsTo(f, reviewer.sessionId)[0];
+    expect(prompt.indexOf("Focus on error handling")).toBeLessThan(
+      prompt.indexOf("<reviewed_task"),
+    );
+    expect(prompt).toContain(`<reviewed_task id="${work.id}">`);
+    expect(prompt).toContain("Original instructions:\nImplement the bounded change");
+    expect(prompt).toContain("Report (done): Implemented it");
+    expect(prompt).toContain("diff --git a/a/file.ts b/a/file.ts");
+    expect(prompt).toContain('status "done" approves');
+    expect(prompt).toContain("read-only reviewer with no write scope");
+    expect(prompt).not.toContain("Patch truncated");
+
+    // The work task can be accepted while its review is still running.
+    await f.call("review", { taskId: work.id });
+    expect(f.tasks()[0].accepted).toBe(true);
+    expect(f.tasks()[1].status).toBe("running");
+  });
+
+  it("splits the patch budget across reviewed tasks and marks truncation", async () => {
+    const f = setup();
+    await f.start(undefined, 3);
+    await f.delegate(["src/a"]);
+    await f.delegate(["src/b"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    const [first, second] = f.tasks();
+    await review(f, [first.id, second.id]);
+    vi.mocked(f.host.workerDiff).mockResolvedValue({
+      files: [],
+      patch: "diff --git a/big b/big\n+partial",
+      truncated: true,
+    });
+    f.completions.get(first.sessionId)!({ status: "completed", text: "A" });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.tasks()[2].status).toBe("queued");
+    f.completions.get(second.sessionId)!({ status: "completed", text: "B" });
+
+    await vi.waitFor(() => expect(f.tasks()[2].status).toBe("running"));
+    expect(f.host.workerDiff).toHaveBeenCalledTimes(2);
+    expect(f.host.workerDiff).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      REVIEW_PATCH_BYTES / 2,
+    );
+    const prompt = promptsTo(f, f.tasks()[2].sessionId)[0];
+    expect(prompt).toContain(
+      `[Patch truncated at ${REVIEW_PATCH_BYTES / 2} bytes. Read the remaining changed files in "/worktrees/${first.id}"`,
+    );
+    expect(prompt).toContain(`<reviewed_task id="${second.id}">`);
+  });
+
+  it("accepts a reviewer without integrating it and reports its verdict on the reviewed task", async () => {
+    const f = setup();
+    await f.start(undefined, 3);
+    await f.delegate(["src/a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const work = f.tasks()[0];
+    await review(f, [work.id]);
+    f.completions.get(work.sessionId)!({ status: "completed", text: doneReport() });
+    await vi.waitFor(() => expect(f.tasks()[1].status).toBe("running"));
+    const reviewer = f.tasks()[1];
+    expect(reviewer.writeScopes).toEqual([]);
+    f.completions.get(reviewer.sessionId)!({
+      status: "completed",
+      text: `Missing a test.\n<monocode_result>{"status":"partial","summary":"Needs a test","changedFiles":[],"checks":[],"blockers":["Add a test for empty input"]}</monocode_result>`,
+    });
+    await vi.waitFor(() => expect(f.tasks()[1].status).toBe("completed"));
+
+    const listed = (await f.call("list")) as {
+      run: { tasks: { reviews?: unknown }[] };
+    };
+    expect(listed.run.tasks[0].reviews).toEqual([
+      {
+        taskId: reviewer.id,
+        title: "Review",
+        status: "completed",
+        verdict: "changes requested",
+      },
+    ]);
+    expect(leadResultText(f.tasks()[1], 4000)).toContain(
+      "completed (review: changes requested)",
+    );
+
+    const accepted = await f.call("review", { taskId: reviewer.id });
+    expect(accepted).toEqual({ accepted: true, integrated: false, cleaned: true });
+    expect(f.host.integrateWorker).not.toHaveBeenCalled();
+    expect(f.host.cleanupWorker).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: reviewer.id }),
+      true,
+    );
+    expect(f.tasks()[1].accepted).toBe(true);
+    await expect(f.call("finish")).rejects.toThrow("Outstanding: Task");
+  });
+});
+
+describe("usage and run budget", () => {
+  it("records each task's turns, time and reported tokens without double counting", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src/a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    await vi.waitFor(() => expect(f.tasks()[0].turns).toBe(1));
+    const worker = f.sessions.find((entry) => entry.id === task.sessionId)!;
+    worker.blocks = [
+      {
+        id: "turn-1",
+        role: "user",
+        text: "Implement",
+        turnMetrics: { inputTokens: 1200, outputTokens: 300 },
+      },
+    ];
+    f.completions.get(task.sessionId)!({ status: "completed", text: "Done" });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.tasks()[0]).toMatchObject({
+      turns: 1,
+      tokens: { input: 1200, output: 300 },
+      usageBlockId: "turn-1",
+    });
+    expect(f.tasks()[0].startedAt).toBeTypeOf("number");
+    expect(f.tasks()[0].finishedAt).toBeGreaterThanOrEqual(
+      f.tasks()[0].startedAt!,
+    );
+    expect(f.tasks()[0].activeMs).toBeGreaterThanOrEqual(0);
+
+    // A turn that reported nothing new must not count the old turn again.
+    await f.call("message", { taskId: task.id, text: "Polish" });
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledTimes(2));
+    f.completions.get(task.sessionId)!({ status: "completed", text: "Done" });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    expect(f.tasks()[0]).toMatchObject({
+      turns: 2,
+      tokens: { input: 1200, output: 300 },
+    });
+
+    const usage = orchestrationUsage(f.manager.run("lead")!);
+    expect(usage).toMatchObject({
+      workerTurns: 2,
+      tokens: { input: 1200, output: 300 },
+    });
+    const listed = (await f.call("list")) as {
+      run: { usage: { workerTurns: number }; tasks: { usageBlockId?: string }[] };
+    };
+    expect(listed.run.usage.workerTurns).toBe(2);
+    expect(listed.run.tasks[0].usageBlockId).toBeUndefined();
+  });
+
+  it("validates budgets before starting", () => {
+    expect(validateOrchestrationBudget(undefined)).toBeUndefined();
+    expect(validateOrchestrationBudget({})).toBeUndefined();
+    expect(
+      validateOrchestrationBudget({ maxMinutes: 30, maxWorkerTurns: 12 }),
+    ).toEqual({ maxMinutes: 30, maxWorkerTurns: 12 });
+    expect(() => validateOrchestrationBudget({ maxMinutes: 0 })).toThrow(
+      "maxMinutes to a whole number from 1 to 1440",
+    );
+    expect(() => validateOrchestrationBudget({ maxWorkerTurns: 2.5 })).toThrow(
+      "maxWorkerTurns",
+    );
+    expect(() => validateOrchestrationBudget({ maxTokens: 5 })).toThrow(
+      'Unknown run budget field "maxTokens"',
+    );
+  });
+
+  it("pauses before a dispatch beyond the turn budget and grants it again on Resume", async () => {
+    const f = setup();
+    await f.start(undefined, 1, { budget: { maxWorkerTurns: 1 } });
+    expect(f.manager.prompt("lead", "Go")).toContain("1 worker turns");
+    await f.delegate(["src/a"]);
+    await f.delegate(["src/b"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: "Done",
+    });
+
+    await vi.waitFor(() => expect(f.manager.run("lead")?.status).toBe("paused"));
+    expect(f.manager.run("lead")?.error).toBe(
+      "Run budget reached: 1 of 1 worker turns used. Its agents were stopped; raise the budget or Resume to continue.",
+    );
+    expect(f.tasks().map((task) => task.status)).toEqual([
+      "completed",
+      "queued",
+    ]);
+
+    f.lead.busy = false;
+    await f.manager.start("lead", ["codex"], 1);
+    await vi.waitFor(() => expect(f.tasks()[1].status).toBe("running"));
+    expect(f.manager.run("lead")).toMatchObject({
+      status: "active",
+      budget: { maxWorkerTurns: 1 },
+      budgetBaseline: { workerTurns: 1 },
+    });
+  });
+
+  it("pauses on settle once the run has used its minutes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = setup();
+    await f.start(undefined, 2, { budget: { maxMinutes: 1 } });
+    await f.delegate(["src/a"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    vi.setSystemTime(Date.now() + 2 * 60_000);
+    f.completions.get(f.tasks()[0].sessionId)!({
+      status: "completed",
+      text: "Done",
+    });
+    await vi.waitFor(() => expect(f.manager.run("lead")?.status).toBe("paused"));
+    expect(f.manager.run("lead")?.error).toContain(
+      "Run budget reached: 2 of 1 minutes used",
+    );
+    expect(f.manager.run("lead")?.activeSince).toBeUndefined();
+    expect(f.manager.run("lead")?.activeMs).toBeGreaterThanOrEqual(120_000);
   });
 });

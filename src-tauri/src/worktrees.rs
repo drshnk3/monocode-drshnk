@@ -350,7 +350,133 @@ fn checkout_state_matches(source: &Path, target: &Path) -> bool {
     })
 }
 
-fn create_seeded(root: &Path, branch: &str) -> Result<Worktree, String> {
+const DEFAULT_DEPENDENCY_DIRS: [&str; 3] = ["node_modules", ".venv", "venv"];
+
+fn dependency_dir_names(names: Option<Vec<String>>) -> Result<Vec<String>, String> {
+    let Some(names) = names else {
+        return Ok(DEFAULT_DEPENDENCY_DIRS.map(String::from).to_vec());
+    };
+    names
+        .into_iter()
+        .map(|name| {
+            let name = name.trim();
+            if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+                return Err(format!("Invalid dependency folder name: {name}"));
+            }
+            Ok(name.to_owned())
+        })
+        .collect()
+}
+
+/// Ignored folders in the lead checkout whose basename is a dependency folder.
+/// `--directory` reports a wholly ignored folder once without descending.
+fn ignored_dependency_dirs(root: &Path, names: &[String]) -> Result<Vec<String>, String> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let listed = git(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    )?;
+    Ok(listed
+        .split('\0')
+        .filter_map(|entry| entry.strip_suffix('/'))
+        .filter(|relative| {
+            relative
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| names.iter().any(|wanted| wanted == name))
+        })
+        .map(String::from)
+        .collect())
+}
+
+/// Copy-on-write clone of one folder: clonefile on macOS, a reflink where the
+/// Linux filesystem supports one (otherwise a regular copy). Windows skips.
+#[cfg(unix)]
+fn clone_dir(from: &Path, to: &Path) -> Result<(), String> {
+    let mut command = Command::new("cp");
+    if cfg!(target_os = "macos") {
+        // clonefile(2); -R copies symbolic links as links.
+        command.args(["-c", "-R"]);
+    } else {
+        command.args(["-a", "--reflink=auto"]);
+    }
+    let output = command
+        .arg("--")
+        .arg(from)
+        .arg(to)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn clone_dir(_from: &Path, _to: &Path) -> Result<(), String> {
+    Err("Copy-on-write folder clones are unavailable on this platform".into())
+}
+
+/// Give a worker the lead's installed dependencies so it can run tests and
+/// type checks. Only folders Git ignores in the worker too are kept, so
+/// checkpoints, dirty checks and integration never see them. Failures skip the
+/// folder; the worker can still run without it.
+fn clone_dependency_dirs(source: &Path, target: &Path, names: &[String]) {
+    if cfg!(windows) {
+        return;
+    }
+    let dirs = match ignored_dependency_dirs(source, names) {
+        Ok(dirs) => dirs,
+        Err(error) => {
+            eprintln!("Skipping dependency folders for the orchestration worktree: {error}");
+            return;
+        }
+    };
+    for relative in dirs {
+        let from = source.join(&relative);
+        let to = target.join(&relative);
+        if path_contains_symlink(source, &relative)
+            || path_contains_symlink(target, &relative)
+            || !std::fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_dir())
+            || std::fs::symlink_metadata(&to).is_ok()
+        {
+            continue;
+        }
+        let cloned = to
+            .parent()
+            .map_or(Ok(()), |parent| {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())
+            })
+            .and_then(|_| clone_dir(&from, &to))
+            .and_then(|_| {
+                git(target, &["check-ignore", "-q", "--", &relative])
+                    .map(|_| ())
+                    .map_err(|_| "it is not ignored in the worker checkout".to_string())
+            });
+        if let Err(error) = cloned {
+            eprintln!(
+                "Skipping dependency folder {relative} for the orchestration worktree: {error}"
+            );
+            let _ = std::fs::remove_dir_all(&to);
+        }
+    }
+}
+
+fn create_seeded(
+    root: &Path,
+    branch: &str,
+    dependency_dirs: &[String],
+) -> Result<Worktree, String> {
     if let Some(tree) = list(root)?
         .into_iter()
         .find(|tree| tree.branch.as_deref() == Some(branch))
@@ -361,6 +487,7 @@ fn create_seeded(root: &Path, branch: &str) -> Result<Worktree, String> {
                 "The recovered orchestration worktree for {branch} is incomplete or has unexpected changes. It was kept for manual review."
             ));
         }
+        clone_dependency_dirs(root, Path::new(&tree.path), dependency_dirs);
         return Ok(tree);
     }
     let branch_ref = format!("refs/heads/{branch}");
@@ -382,20 +509,27 @@ fn create_seeded(root: &Path, branch: &str) -> Result<Worktree, String> {
         }
         return Err(error);
     }
+    clone_dependency_dirs(root, Path::new(&tree.path), dependency_dirs);
     Ok(tree)
 }
 
 /// Create an isolated worker checkout with the lead checkout's current file
 /// contents as its baseline. Reusing the deterministic branch makes a crash
 /// between Git creation and run-state persistence recoverable.
+/// `dependency_dirs` names ignored folders to clone at any depth; it defaults
+/// to node_modules, .venv and venv.
 #[tauri::command(async)]
 pub async fn git_orchestration_worktree_create(
     cwd: String,
     branch: String,
+    dependency_dirs: Option<Vec<String>>,
 ) -> Result<Worktree, String> {
-    tauri::async_runtime::spawn_blocking(move || create_seeded(&expand_home(&cwd), branch.trim()))
-        .await
-        .map_err(|error| error.to_string())?
+    let dependency_dirs = dependency_dir_names(dependency_dirs)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        create_seeded(&expand_home(&cwd), branch.trim(), &dependency_dirs)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn rename_branch(root: &Path, path: &Path, branch: &str) -> Result<Worktree, String> {
@@ -887,7 +1021,7 @@ mod tests {
         std::fs::write(root.join("untracked.txt"), "lead new\n").unwrap();
         std::fs::remove_file(root.join("deleted.txt")).unwrap();
 
-        let tree = create_seeded(&root, "mc/orch-testworker").unwrap();
+        let tree = create_seeded(&root, "mc/orch-testworker", &[]).unwrap();
         let worker = Path::new(&tree.path);
         assert_eq!(
             std::fs::read_to_string(worker.join("tracked.txt")).unwrap(),
@@ -899,17 +1033,96 @@ mod tests {
         );
         assert!(!worker.join("deleted.txt").exists());
         assert_eq!(
-            create_seeded(&root, "mc/orch-testworker").unwrap().path,
+            create_seeded(&root, "mc/orch-testworker", &[])
+                .unwrap()
+                .path,
             tree.path
         );
 
         std::fs::write(root.join("tracked.txt"), "later lead edit\n").unwrap();
-        assert!(create_seeded(&root, "mc/orch-testworker").is_err());
+        assert!(create_seeded(&root, "mc/orch-testworker", &[]).is_err());
         assert_eq!(
             std::fs::read_to_string(worker.join("tracked.txt")).unwrap(),
             "lead dirty\n"
         );
         remove(&root, worker, true).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_worktree_clones_ignored_dependency_folders() {
+        let repo = repo();
+        let root = repo.0.join("repo");
+        std::fs::write(root.join(".gitignore"), "node_modules/\n.venv/\ndist/\n").unwrap();
+        std::fs::create_dir_all(root.join("packages/app")).unwrap();
+        std::fs::write(root.join("packages/app/index.ts"), "app\n").unwrap();
+        git_checked(&root, &["add", "."]).unwrap();
+        git_checked(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "files",
+            ],
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "dep\n").unwrap();
+        std::os::unix::fs::symlink("../pkg/index.js", root.join("node_modules/.bin/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("packages/app/node_modules/nested")).unwrap();
+        std::fs::write(root.join("packages/app/node_modules/nested/a.js"), "a\n").unwrap();
+        std::fs::create_dir_all(root.join(".venv/lib")).unwrap();
+        std::fs::write(root.join(".venv/lib/site.py"), "site\n").unwrap();
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/out.js"), "built\n").unwrap();
+
+        let names = dependency_dir_names(None).unwrap();
+        let tree = create_seeded(&root, "mc/orch-depsworker", &names).unwrap();
+        let worker = Path::new(&tree.path);
+        assert_eq!(
+            std::fs::read_to_string(worker.join("node_modules/pkg/index.js")).unwrap(),
+            "dep\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(worker.join("node_modules/.bin/pkg"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(worker
+            .join("packages/app/node_modules/nested/a.js")
+            .is_file());
+        assert!(worker.join(".venv/lib").is_dir());
+        assert!(!worker.join("dist").exists());
+        assert!(git(
+            worker,
+            &["status", "--porcelain", "--untracked-files=normal"]
+        )
+        .unwrap()
+        .is_empty());
+
+        // A recovered worktree regains a missing folder and keeps the rest.
+        std::fs::remove_dir_all(worker.join("node_modules")).unwrap();
+        std::fs::write(worker.join(".venv/lib/marker"), "kept\n").unwrap();
+        assert_eq!(
+            create_seeded(&root, "mc/orch-depsworker", &names)
+                .unwrap()
+                .path,
+            tree.path
+        );
+        assert!(worker.join("node_modules/pkg/index.js").is_file());
+        assert!(worker.join(".venv/lib/marker").is_file());
+
+        check_removal(&root, worker, false, false).unwrap();
+        remove(&root, worker, false).unwrap();
+        assert!(!worker.exists());
+        assert!(root.join("node_modules/pkg/index.js").is_file());
+        assert!(dependency_dir_names(Some(vec!["../x".into()])).is_err());
     }
 
     #[test]

@@ -13,6 +13,7 @@ import type {
   ProposedTask,
 } from "../model/orchestrationPlan";
 import { orchestrator } from "../model/orchestration";
+import { parallelWorkerOptions } from "../model/orchestrationLimits";
 import { resizeComposer } from "../../sessions/model/composerResize";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import {
@@ -738,7 +739,7 @@ export function OrchestrationPreview({
                   aria-label="Parallel workers"
                   className="flex items-center gap-0.5 rounded-md bg-content/5 p-0.5"
                 >
-                  {[1, 2, 3, 4].map((number) => (
+                  {parallelWorkerOptions().map((number) => (
                     <button
                       key={number}
                       type="button"

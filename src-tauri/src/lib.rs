@@ -25,6 +25,7 @@ mod mcp;
 mod menu;
 mod notes;
 mod notifications;
+mod orchestration_checks;
 mod pasteboard;
 mod pi_usage;
 mod project_logo;
@@ -278,6 +279,7 @@ pub fn run() {
             control::control_authorize_turn,
             control::control_turn_finished,
             control::app_cli_path,
+            orchestration_checks::orchestration_run_check,
             default_cwd,
             home_dir,
             notifications::notification_permission,
@@ -488,6 +490,7 @@ pub fn run() {
             checkpoint::session_checkpoint_cleanup_safe,
             checkpoint::session_checkpoint_forget,
             checkpoint::session_checkpoint_file_diff,
+            checkpoint::session_checkpoint_patch,
             checkpoint::session_checkpoint_undo,
             checkpoint::session_checkpoint_keep,
             set_traffic_lights_visible,

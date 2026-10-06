@@ -29,6 +29,8 @@ export type CheckpointFileDiff = {
 export type CheckpointApplyResult = {
   files: string[];
   alreadyApplied: number;
+  /** Files whose lead copy had also changed and were merged three-way. */
+  merged: string[];
 };
 
 const REVIEW_CHANGED = "monocode-review-changed";

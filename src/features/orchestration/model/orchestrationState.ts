@@ -1,11 +1,22 @@
 import { pathKey } from "../../../shared/lib/paths";
 import type { OrchestrationChoice } from "./orchestrationPlan";
 import type { HarnessId } from "../../sessions/model/session";
+import {
+  resolveOrchestrationLimits,
+  type OrchestrationBudget,
+  type OrchestrationLimits,
+} from "./orchestrationLimits";
 
+/**
+ * `checking`: the worker's turn finished and the app is running its acceptance
+ * checks. The worker process is idle, but the task still owns its scope and is
+ * not yet a result the lead can review.
+ */
 export type TaskStatus =
   | "queued"
   | "running"
   | "cancelling"
+  | "checking"
   | "completed"
   | "failed"
   | "blocked"
@@ -60,10 +71,59 @@ export type OrchestrationDispatch = {
   cleanupError?: string;
 };
 
+/** One focused check a worker says it ran. */
+export type WorkerCheck = {
+  command: string;
+  passed: boolean;
+  note?: string;
+};
+
+/** Structured summary a worker appends to its final message. */
+export type WorkerReport = {
+  status: "done" | "partial" | "blocked";
+  summary: string;
+  changedFiles: string[];
+  checks: WorkerCheck[];
+  blockers: string[];
+  followUps?: string[];
+};
+
+/** A file the worker's session actually changed, from its checkpoint. */
+export type WorkerChange = {
+  relative: string;
+  status: string;
+  additions: number;
+  deletions: number;
+};
+
+/** One acceptance check the app ran in the worker's checkout. */
+export type CheckResult = {
+  command: string;
+  passed: boolean;
+  /** Null when the process was killed (timeout), signalled or never started. */
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  /** End of the combined output, capped at `CHECK_OUTPUT_CHARS`. */
+  outputTail: string;
+};
+
+/** Output kept per check result. */
+export const CHECK_OUTPUT_CHARS = 4000;
+/** Acceptance checks one task may carry, and the longest command. */
+export const MAX_TASK_CHECKS = 5;
+export const MAX_CHECK_COMMAND = 500;
+
+export type TaskKind = "work" | "review";
+
 export type OrchestrationTask = {
   id: string;
   assignmentId?: string;
   sessionId: string;
+  /** Absent means "work". A review task reads `reviewOf` and never writes. */
+  kind?: TaskKind;
+  /** Tasks a review task inspects; it runs once each of them has completed. */
+  reviewOf?: string[];
   title: string;
   harness: HarnessId;
   model: string;
@@ -78,7 +138,12 @@ export type OrchestrationTask = {
   dependsOn: string[];
   status: TaskStatus;
   accepted: boolean;
+  /** Human-readable tail of the final message, without its report block. */
   result: string;
+  /** Parsed `<monocode_result>` of the last turn, when the worker gave one. */
+  report?: WorkerReport;
+  /** Files the last turn actually changed; absent when they could not be read. */
+  changes?: WorkerChange[];
   error?: string;
   /** A retained worker can continue safely with this recovery turn. */
   recoveryPrompt?: string;
@@ -91,6 +156,31 @@ export type OrchestrationTask = {
   activeDispatchId?: string;
   lastDispatchId?: string;
   acceptedDispatchId?: string;
+  /** Commands the app runs in the worker's checkout after each successful turn. */
+  checks?: string[];
+  /** Results of the latest check run; replaced by every new run. */
+  checkResults?: CheckResult[];
+  /** Automatic fix turns sent for failing checks since the lead's last instruction. */
+  checkRetries?: number;
+  /** Only this check run may record results; a newer run or a cancel voids it. */
+  checkRunId?: string;
+  /** Checks were interrupted: Resume re-runs them instead of a worker turn. */
+  recheck?: boolean;
+  /** The app accepted this task because its checks passed in an autoAccept run. */
+  autoAccepted?: boolean;
+  /** Why automatic acceptance failed; the lead decides instead. */
+  autoAcceptError?: string;
+  /** First and latest worker turn boundaries, epoch ms. */
+  startedAt?: number;
+  finishedAt?: number;
+  /** Summed duration of this task's worker turns. */
+  activeMs?: number;
+  /** Worker turns dispatched, including automatic check fixes. */
+  turns?: number;
+  /** Provider-reported tokens summed over the turns that reported them. */
+  tokens?: { input: number; output: number };
+  /** Transcript turn whose token metrics were last counted, to never count twice. */
+  usageBlockId?: string;
 };
 
 export type OrchestrationRun = {
@@ -105,7 +195,11 @@ export type OrchestrationRun = {
   allowedHarnesses: HarnessId[];
   allowedModels?: OrchestrationChoice[];
   proposalId?: string;
+  /** Shared context from planning, sent ahead of every worker prompt. */
+  brief?: string;
   maxWorkers: number;
+  /** Absent in runs saved before limits existed; read via `orchestrationLimits`. */
+  limits?: OrchestrationLimits;
   cli: string;
   tasks: OrchestrationTask[];
   dispatches?: OrchestrationDispatch[];
@@ -113,7 +207,38 @@ export type OrchestrationRun = {
   continuations: number;
   lastPauseReason?: string;
   requests: Record<string, { signature: string; result: unknown }>;
+  /** Accept a completed task automatically once all of its checks pass. */
+  autoAccept?: boolean;
+  budget?: OrchestrationBudget;
+  /** Usage at the last Resume after the budget ran out; the budget counts from here. */
+  budgetBaseline?: { elapsedMs: number; workerTurns: number };
+  /** Active run time accumulated before `activeSince`. */
+  activeMs?: number;
+  /** When the run last became active; absent while inactive. */
+  activeSince?: number;
 };
+
+/** In-progress and not yet a result: a live worker turn or its checks. */
+export const busyTask = (task: OrchestrationTask) =>
+  task.status === "running" ||
+  task.status === "cancelling" ||
+  task.status === "checking";
+
+/** Wall-clock time the run has spent active. */
+export const runElapsedMs = (run: OrchestrationRun, now = Date.now()) =>
+  (run.activeMs ?? 0) +
+  (run.status === "active" && run.activeSince
+    ? Math.max(0, now - run.activeSince)
+    : 0);
+
+/** Fold the current active stretch into `activeMs`, for a run leaving "active". */
+export const settleActiveTime = (
+  run: OrchestrationRun,
+  now = Date.now(),
+): Pick<OrchestrationRun, "activeMs" | "activeSince"> => ({
+  activeMs: runElapsedMs(run, now),
+  activeSince: undefined,
+});
 
 export function workspaceIdentity(
   projectCwd: string,
@@ -140,6 +265,9 @@ export const orchestrationProjectCwd = (run: OrchestrationRun) =>
 
 export const orchestrationCheckoutCwd = (run: OrchestrationRun) =>
   orchestrationWorkspace(run).checkoutCwd;
+
+export const orchestrationLimits = (run: OrchestrationRun) =>
+  resolveOrchestrationLimits(run.limits);
 
 export function normalizeOrchestrationRun(
   run: OrchestrationRun,
@@ -184,7 +312,9 @@ export function normalizeOrchestrationRun(
   const statusByDispatch = new Map(
     tasks.flatMap((task) =>
       task.lastDispatchId &&
-      (task.status === "blocked" || task.status === "interrupted")
+      // Interrupted checks ran after their dispatch had already completed.
+      (task.status === "blocked" ||
+        (task.status === "interrupted" && !task.recheck))
         ? [[task.lastDispatchId, task.status] as const]
         : [],
     ),
@@ -194,6 +324,7 @@ export function normalizeOrchestrationRun(
     version: 2,
     cwd: workspace.projectCwd,
     workspace,
+    limits: resolveOrchestrationLimits(run.limits),
     tasks,
     dispatches: (run.dispatches ?? []).map((dispatch) => ({
       ...dispatch,
