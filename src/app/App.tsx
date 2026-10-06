@@ -46,6 +46,20 @@ import {
 } from "../features/orchestration/model/orchestrationPlan";
 import { discoverOrchestrationSettings } from "../features/orchestration/model/orchestrationCatalog";
 import {
+  effectiveAutoAccept,
+  quickModeStarts,
+} from "../features/orchestration/model/orchestrationCard";
+import {
+  WorktreePrewarmer,
+  localPrewarmJournal,
+  prewarmTargets,
+} from "../features/orchestration/model/orchestrationPrewarm";
+import {
+  findOrchestrationTemplate,
+  templatePlan,
+} from "../features/orchestration/model/orchestrationTemplates";
+import { loadOrchestrationPreferences } from "../features/settings/model/orchestration";
+import {
   attachOrchestrationWorkers,
   consolidateOrchestrationTabs,
   prepareOrchestrationWorkerDetails,
@@ -719,6 +733,34 @@ type LinkedWorkItemPanelState = {
   cwd: string;
 };
 
+/**
+ * Worker worktrees prepared while a proposal card waits. Its journal lets the
+ * next launch remove any this window left behind.
+ */
+const worktreePrewarmer = new WorktreePrewarmer({
+  create: (cwd, branch) =>
+    createOrchestrationWorktree(
+      cwd,
+      branch,
+      loadOrchestrationPreferences().dependencyDirs,
+    ),
+  remove: async (cwd, branch, path) => {
+    if (path) {
+      const listed = await listWorktrees(cwd);
+      if (listed.worktrees.some((tree) => pathKey(tree.path) === pathKey(path)))
+        await removeOrchestrationWorktree(cwd, path);
+    }
+    await removeOrchestrationBranch(cwd, branch);
+  },
+  list: async (cwd) => (await listWorktrees(cwd)).worktrees,
+  owned: (leadId, path, branch) =>
+    orchestrator.ownsWorktree(leadId, path, branch),
+  // "pw" is not hex, so no run task id can produce the same branch.
+  branchName: () =>
+    orchestrationWorktreeBranchName(`pw${crypto.randomUUID()}`),
+  journal: localPrewarmJournal,
+});
+
 type SubmitOptions = ComposerTurnOptions & {
   ciRepair?: CiRepairRequest;
   /** Saved alongside the user turn; does not replace the submitted prompt. */
@@ -1134,6 +1176,62 @@ function Workspace({
 
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+  /** Proposal cards planned or edited in this window, the ones worth pre-warming. */
+  const freshProposals = useRef(new Set<string>());
+  /** Set once the card actions exist; quick mode confirms through it. */
+  const confirmOrchestrationRef = useRef<
+    | ((leadId: string, blockId: string, auto?: boolean) => Promise<void>)
+    | null
+  >(null);
+  /**
+   * Quick mode: confirm a freshly planned card exactly as a click would, when
+   * it is small and valid. The planning turn settles first, so wait briefly
+   * for the lead to be idle.
+   */
+  const startQuickModeProposal = useCallback(
+    (leadId: string, blockId: string) => {
+      let attempts = 0;
+      const proposalNow = () =>
+        sessionsRef.current
+          .find((entry) => entry.id === leadId)
+          ?.blocks.find((block) => block.id === blockId)?.orchestration;
+      const attempt = () => {
+        const session = sessionsRef.current.find(
+          (entry) => entry.id === leadId,
+        );
+        const proposal = proposalNow();
+        if (
+          !session ||
+          !proposal ||
+          !quickModeStarts(proposal, loadOrchestrationPreferences())
+        )
+          return;
+        const confirm = confirmOrchestrationRef.current;
+        if (session.busy || !confirm) {
+          if (++attempts < 8) window.setTimeout(attempt, 250);
+          return;
+        }
+        void confirm(leadId, blockId, true).catch((error: unknown) => {
+          const current = proposalNow();
+          if (current?.status !== "ready") return;
+          const next = sessionsRef.current.map((entry) =>
+            entry.id === leadId
+              ? withOrchestrationProposal(entry, blockId, {
+                  ...current,
+                  error: `Quick mode could not start this plan: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                })
+              : entry,
+          );
+          sessionsRef.current = next;
+          setSessions(next);
+        });
+      };
+      window.setTimeout(attempt, 0);
+    },
+    [],
+  );
   const linkedSessionUpdatesRef = useRef<
     ReadonlyMap<string, LinkedSessionUpdate>
   >(new Map());
@@ -6433,8 +6531,19 @@ function Workspace({
       turnGen.current.set(sessionId, gen);
       const proposalId =
         intent === "orchestrate" ? crypto.randomUUID() : undefined;
+      if (proposalId) freshProposals.current.add(proposalId);
+      // A retry keeps the template its first attempt was planned from.
+      const proposalTemplate =
+        options?.orchestrationRetry?.template ??
+        (() => {
+          const template = findOrchestrationTemplate(
+            options?.orchestrationTemplateId,
+          );
+          return template ? templatePlan(template) : undefined;
+        })();
       let proposalDraft: OrchestrationProposal | undefined = proposalId
         ? {
+            ...(proposalTemplate ? { template: proposalTemplate } : {}),
             version: 1,
             leadId: sessionId,
             cwd: current.cwd,
@@ -6769,8 +6878,18 @@ function Workspace({
         launchTitleGeneration(workCwd);
         if (turnGen.current.get(sessionId) !== gen) return;
         if (proposalDraft && proposalId) {
-          const settings = await discoverOrchestrationSettings();
+          const discovered = await discoverOrchestrationSettings();
           if (turnGen.current.get(sessionId) !== gen) return;
+          // The card starts from the user's Settings > Orchestration defaults.
+          const preferences = loadOrchestrationPreferences();
+          const settings = {
+            ...discovered,
+            maxWorkers: Math.min(
+              discovered.maxWorkers,
+              preferences.limits.maxWorkers,
+            ),
+            ...(preferences.autoAccept ? { autoAccept: true } : {}),
+          };
           proposalDraft = { ...proposalDraft, settings };
           const discovering = proposalDraft;
           setSessions((prev) =>
@@ -6938,6 +7057,7 @@ function Workspace({
                   prompt,
                   proposalDraft.settings,
                   proposalDraft.checkoutCwd ?? proposalDraft.cwd,
+                  proposalDraft.template,
                 )
             : intent === "plan" && !rawCommand
               ? planTurnPrompt(prompt)
@@ -7151,6 +7271,13 @@ function Workspace({
             const visible = sessionId === activeSessionIdRef.current;
             if (finished) void announceSessionFinished(finished, visible);
           }, 0);
+          if (
+            proposalId &&
+            completedProposal?.status === "ready" &&
+            buildSucceeded &&
+            !providerFailureSeen
+          )
+            startQuickModeProposal(sessionId, proposalId);
           notifyReviewChanged(sessionId);
           notifyGitChanged();
           nudgeWorkspace(workCwd);
@@ -8876,16 +9003,25 @@ function Workspace({
                     tree.branch ?? task.workspace!.branch,
                   );
                 })
-              : await createOrchestrationWorktree(
-                  leadCheckoutCwd,
-                  orchestrationWorktreeBranchName(task.id),
-                ).then((tree) =>
-                  workspaceIdentity(
-                    projectCwd,
-                    tree.path,
-                    tree.branch ?? undefined,
-                  ),
-                );
+              : // A worktree pre-warmed for this assignment while the card
+                // waited is verified against the lead checkout and reused.
+                await worktreePrewarmer
+                  .worktreeFor(
+                    {
+                      leadId: run.leadId,
+                      proposalId: run.proposalId,
+                      assignmentId: task.assignmentId,
+                    },
+                    leadCheckoutCwd,
+                    orchestrationWorktreeBranchName(task.id),
+                  )
+                  .then((tree) =>
+                    workspaceIdentity(
+                      projectCwd,
+                      tree.path,
+                      tree.branch ?? undefined,
+                    ),
+                  );
         const checkoutCwd = workspace.checkoutCwd;
         const scratchDir = await invoke<string>("control_attach_worker", {
           leadId: run.leadId,
@@ -9236,6 +9372,23 @@ function Workspace({
     orchestrator.sync();
   }, [sessions]);
 
+  // Keep pre-warmed worker worktrees in step with the proposal cards: prepare
+  // for a ready card, hold for a starting run, remove for anything else.
+  useEffect(() => {
+    worktreePrewarmer.sync(
+      prewarmTargets(
+        sessions,
+        orchestrationRuns,
+        loadOrchestrationPreferences().prewarm,
+        freshProposals.current,
+      ),
+    );
+  }, [sessions, orchestrationRuns]);
+
+  useEffect(() => {
+    void worktreePrewarmer.cleanupStale().catch(console.error);
+  }, []);
+
   useEffect(() => {
     const listening = listen<{
       id: string;
@@ -9551,6 +9704,65 @@ function Workspace({
     },
     [],
   );
+  /** Confirm & start, by click or by quick mode (`auto`). */
+  const confirmOrchestration = useCallback(
+    async (leadId: string, blockId: string, auto = false) => {
+      if (confirmingOrchestration.current.has(leadId)) return;
+      confirmingOrchestration.current.add(leadId);
+      let proposal: OrchestrationProposal | undefined;
+      try {
+        await orchestrator.hydrate(leadId);
+        const session = sessionsRef.current.find(
+          (entry) => entry.id === leadId,
+        );
+        proposal = session?.blocks.find(
+          (block) => block.id === blockId,
+        )?.orchestration;
+        if (!session || session.busy || proposal?.status !== "ready")
+          throw new Error("Wait for the proposal to finish before confirming.");
+        if (
+          session.harness !== proposal.author.harness ||
+          session.model !== proposal.author.model
+        )
+          throw new Error(
+            "The lead model has changed. Switch back to the model shown on this card, or generate a new proposal.",
+          );
+        const confirmed = {
+          ...proposal,
+          error: undefined,
+          ...(auto ? { autoStarted: true } : {}),
+        };
+        const starting = updateOrchestrationCard(leadId, blockId, {
+          ...confirmed,
+          status: "starting",
+        })!;
+        // Save the edited card before anything can execute.
+        await upsertSession(starting);
+        await orchestrator.startApproved(
+          leadId,
+          blockId,
+          proposal,
+          loadOrchestrationPreferences().limits,
+          { autoAccept: effectiveAutoAccept(proposal) },
+        );
+        updateOrchestrationCard(leadId, blockId, {
+          ...confirmed,
+          status: "approved",
+        });
+      } catch (error) {
+        if (proposal)
+          updateOrchestrationCard(leadId, blockId, {
+            ...proposal,
+            status: "ready",
+          });
+        throw error;
+      } finally {
+        confirmingOrchestration.current.delete(leadId);
+      }
+    },
+    [updateOrchestrationCard],
+  );
+  confirmOrchestrationRef.current = confirmOrchestration;
   const orchestrationActions = useMemo(
     () => ({
       open: onOpenApprovalSession,
@@ -9573,62 +9785,37 @@ function Workspace({
           confirmingOrchestration.current.has(leadId)
         )
           return;
-        // Keep the discovered catalog authoritative while allowing task and parallelism edits.
-        const settings = validateOrchestrationSettings({
-          ...proposal.settings,
-          maxWorkers: edited.settings.maxWorkers,
-        });
+        freshProposals.current.add(blockId);
+        // Keep the discovered catalog authoritative while allowing task,
+        // brief, parallelism, auto-accept and budget edits. The budget is
+        // kept as typed; the card shows its error and starting rejects it.
+        const { limits } = loadOrchestrationPreferences();
+        const settings = {
+          ...validateOrchestrationSettings(
+            {
+              ...proposal.settings,
+              maxWorkers: Math.min(
+                edited.settings.maxWorkers,
+                limits.maxWorkers,
+              ),
+              autoAccept: undefined,
+              budget: undefined,
+            },
+            limits,
+          ),
+          ...(edited.settings.autoAccept ? { autoAccept: true } : {}),
+          ...(edited.settings.budget ? { budget: edited.settings.budget } : {}),
+        };
         updateOrchestrationCard(leadId, blockId, {
           ...proposal,
           settings,
+          brief: edited.brief,
           tasks: edited.tasks,
+          error: undefined,
         });
       },
-      confirm: async (leadId: string, blockId: string) => {
-        if (confirmingOrchestration.current.has(leadId)) return;
-        confirmingOrchestration.current.add(leadId);
-        let proposal: OrchestrationProposal | undefined;
-        try {
-          await orchestrator.hydrate(leadId);
-          const session = sessionsRef.current.find(
-            (entry) => entry.id === leadId,
-          );
-          proposal = session?.blocks.find(
-            (block) => block.id === blockId,
-          )?.orchestration;
-          if (!session || session.busy || proposal?.status !== "ready")
-            throw new Error(
-              "Wait for the proposal to finish before confirming.",
-            );
-          if (
-            session.harness !== proposal.author.harness ||
-            session.model !== proposal.author.model
-          )
-            throw new Error(
-              "The lead model has changed. Switch back to the model shown on this card, or generate a new proposal.",
-            );
-          const starting = updateOrchestrationCard(leadId, blockId, {
-            ...proposal,
-            status: "starting",
-          })!;
-          // Save the edited card before anything can execute.
-          await upsertSession(starting);
-          await orchestrator.startApproved(leadId, blockId, proposal);
-          updateOrchestrationCard(leadId, blockId, {
-            ...proposal,
-            status: "approved",
-          });
-        } catch (error) {
-          if (proposal)
-            updateOrchestrationCard(leadId, blockId, {
-              ...proposal,
-              status: "ready",
-            });
-          throw error;
-        } finally {
-          confirmingOrchestration.current.delete(leadId);
-        }
-      },
+      confirm: (leadId: string, blockId: string) =>
+        confirmOrchestration(leadId, blockId),
       retry: (leadId: string, blockId: string) => {
         const session = sessionsRef.current.find(
           (entry) => entry.id === leadId,
@@ -9648,6 +9835,7 @@ function Workspace({
       queueWorkerPanes,
       onSubmit,
       updateOrchestrationCard,
+      confirmOrchestration,
     ],
   );
 

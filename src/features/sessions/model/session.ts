@@ -84,6 +84,8 @@ export type ComposerTurnOptions = {
   onResendRejected?: (recovery: EditedResendRejection) => void;
   /** Promote an existing unsent transcript block instead of appending a turn. */
   draftBlockId?: string;
+  /** Saved orchestration template an orchestrate turn plans from. */
+  orchestrationTemplateId?: string;
 };
 
 export type PlanStatus = "streaming" | "ready" | "building" | "built";

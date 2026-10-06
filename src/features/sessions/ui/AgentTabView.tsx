@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AgentTranscript } from "./AgentTranscript";
 import { TranscriptFind } from "./TranscriptFind";
 import {
@@ -15,6 +15,7 @@ import {
   type Session,
 } from "../model/session";
 import { createNote, noteTitle } from "../../notes";
+import { workerVisibleBlocks } from "../../orchestration/model/orchestrationReport";
 import { loadNotesEnabled, subscribeNotesEnabled } from "../../settings/model/settings";
 
 /**
@@ -101,6 +102,11 @@ export function AgentTabView({
     },
     [session?.cwd, session?.id],
   );
+  // The result JSON is for the lead; a person reads a one-line status.
+  const blocks = useMemo(
+    () => (session ? workerVisibleBlocks(session.blocks) : []),
+    [session?.blocks],
+  );
   if (!session) {
     return (
       <div className="grid h-full place-items-center px-6 text-center">
@@ -116,7 +122,7 @@ export function AgentTabView({
     <div data-agent-tab className="flex h-full min-h-0 flex-col">
       <div className="@container relative min-h-0 flex-1">
         <AgentTranscript
-          blocks={session.blocks}
+          blocks={blocks}
           busy={session.busy}
           cwd={sessionWorkCwd(session)}
           harness={session.harness}
@@ -129,7 +135,7 @@ export function AgentTabView({
           managed
         />
         <TranscriptFind
-          blocks={session.blocks}
+          blocks={blocks}
           visible={visible}
           focused={focused}
           onNavigate={navigateBlock}

@@ -2,6 +2,8 @@ import { HARNESSES, type Block, type HarnessId, type Session } from "../../sessi
 import { isEqualOrInside, pathKey } from "../../../shared/lib/paths";
 import {
   DEFAULT_ORCHESTRATION_LIMITS,
+  validateOrchestrationBudget,
+  type OrchestrationBudget,
   type OrchestrationLimits,
 } from "./orchestrationLimits";
 import {
@@ -9,6 +11,10 @@ import {
   MAX_TASK_CHECKS,
   type TaskKind,
 } from "./orchestrationState";
+import {
+  templatePromptSection,
+  type OrchestrationTemplatePlan,
+} from "./orchestrationTemplates";
 
 /** Longest shared brief a proposal may carry into every worker prompt. */
 export const MAX_ORCHESTRATION_BRIEF = 8000;
@@ -23,6 +29,8 @@ export type OrchestrationSettings = {
   maxWorkers: number;
   /** Accept tasks whose app-run checks all pass without waiting for the lead. */
   autoAccept?: boolean;
+  /** Optional caps chosen on the card; absent means unlimited. */
+  budget?: OrchestrationBudget;
 };
 export type ProposedTask = {
   id: string;
@@ -90,6 +98,10 @@ export type OrchestrationProposal = {
   error?: string;
   /** Kept only for invalid cards so a retry can repair the response directly. */
   response?: string;
+  /** Saved plan the user started this request from; a repair keeps it. */
+  template?: OrchestrationTemplatePlan;
+  /** Quick mode confirmed this card without a click. */
+  autoStarted?: boolean;
 };
 
 function required(value: unknown, label: string, max = 30_000): string {
@@ -198,9 +210,11 @@ export function validateOrchestrationSettings(
   });
   if (input.autoAccept != null && typeof input.autoAccept !== "boolean")
     throw new Error("autoAccept must be true or false");
+  const budget = validateOrchestrationBudget(input.budget);
   return {
     maxWorkers: Number(input.maxWorkers),
     ...(input.autoAccept === true ? { autoAccept: true } : {}),
+    ...(budget ? { budget } : {}),
     choices: choices.filter(
       (choice, index) =>
         choices.findIndex(
@@ -360,6 +374,7 @@ export function orchestrationPlanningPrompt(
   request: string,
   settings: OrchestrationSettings,
   cwd: string,
+  template?: OrchestrationTemplatePlan,
 ): string {
   return [
     "Prepare an orchestration proposal for the user to review in MonoCode. Investigate and plan only: do not edit files, start workers, or invoke the MonoCode control CLI. No execution is authorized until the user confirms the assignment card.",
@@ -374,6 +389,7 @@ export function orchestrationPlanningPrompt(
     'Schema: {"title":"Short project title","summary":"What you will do and how the work fits together","brief":"Shared conventions, key files and architecture notes for every worker","tasks":[{"id":"task-1","title":"Short task title","prompt":"Self-contained instructions, constraints and checks","harness":"exact harness ID","model":"exact model ID","files":["src/feature"],"dependsOn":[],"checks":["npx vitest run src/feature"]},{"id":"review-1","kind":"review","reviewOf":["task-1"],"title":"Review the feature","prompt":"What to scrutinize","harness":"exact harness ID","model":"exact model ID","files":[],"dependsOn":[]}]}',
     `Parallel worker limit: ${settings.maxWorkers}`,
     `<available_models>\n${JSON.stringify(settings.choices)}\n</available_models>`,
+    ...(template ? [templatePromptSection(template)] : []),
     `<user_request>\n${request}\n</user_request>`,
   ].join("\n\n");
 }
@@ -426,6 +442,7 @@ export function orchestrationRepairPrompt(
       proposal.request,
       proposal.settings,
       proposal.checkoutCwd ?? proposal.cwd,
+      proposal.template,
     ),
     "Correct the previous proposal using the validation error below. Reuse your investigation and task breakdown; do not inspect the project again or run tools. Return only the corrected <monocode_proposal> JSON. Include an exact harness and model on every task. Do not execute any assignments.",
     `Validation error: ${proposal.error ?? "The previous proposal was invalid"}`,
@@ -447,16 +464,31 @@ export async function completeOrRepairOrchestrationProposal(
 }
 
 export function proposalMarkdown(proposal: OrchestrationProposal): string {
+  const title = (id: string) =>
+    proposal.tasks.find((task) => task.id === id)?.title ?? id;
+  const budget = proposal.settings.budget;
+  const runLines = [
+    proposal.template ? `Template: ${proposal.template.name}` : "",
+    proposal.settings.autoAccept
+      ? "Auto-accept tasks whose checks pass"
+      : "",
+    budget?.maxMinutes ? `Budget: ${budget.maxMinutes} minutes` : "",
+    budget?.maxWorkerTurns
+      ? `Budget: ${budget.maxWorkerTurns} worker turns`
+      : "",
+  ].filter(Boolean);
   return [
     `# ${proposal.title}`,
     proposal.summary,
+    ...(runLines.length ? [runLines.join("\n")] : []),
+    ...(proposal.brief ? [`## Brief\n${proposal.brief}`] : []),
     ...proposal.tasks.map(
       (task) =>
-        `## ${task.title}\n${task.harness} · ${proposal.settings.choices.find((choice) => choice.harness === task.harness && choice.model === task.model)?.name ?? task.model}\n${task.prompt}\n${
+        `## ${task.kind === "review" ? "Review: " : ""}${task.title}\n${task.harness} · ${proposal.settings.choices.find((choice) => choice.harness === task.harness && choice.model === task.model)?.name ?? task.model}\n${task.prompt}\n${
           task.kind === "review"
-            ? `Reviews: ${task.reviewOf?.join(", ") ?? ""}`
+            ? `Reviews: ${(task.reviewOf ?? []).map(title).join(", ")}`
             : `Files: ${task.files.join(", ")}`
-        }\nDepends on: ${task.dependsOn.join(", ") || "None"}${
+        }\nDepends on: ${task.dependsOn.map(title).join(", ") || "None"}${
           task.checks?.length ? `\nChecks: ${task.checks.join("; ")}` : ""
         }`,
     ),

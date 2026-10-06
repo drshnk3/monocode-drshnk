@@ -1,7 +1,12 @@
 import type { OrchestrationRun, TaskStatus } from "./orchestration";
 import { sessionNeedsInput, type HarnessId, type Session } from "../../sessions/model/session";
 import { formatTokens } from "../../sessions/model/contextUsage";
-import { runElapsedMs } from "./orchestrationState";
+import {
+  runElapsedMs,
+  type CheckResult,
+  type OrchestrationTask,
+} from "./orchestrationState";
+import { reviewVerdict } from "./orchestrationReport";
 
 /** Small history projection; never includes prompts, results or credentials. */
 export type OrchestrationSummary = {
@@ -102,6 +107,114 @@ export function formatDuration(ms: number): string {
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes}m`;
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** A task still in progress: a worker turn, its stop, or its checks. */
+export const activeTaskStatus = (status: TaskStatus) =>
+  status === "running" || status === "cancelling" || status === "checking";
+
+export type TaskTone = "attention" | "active" | "done" | "idle";
+
+/** Colour family of a task's status label, shared by the sidebar surfaces. */
+export function orchestrationTaskTone(
+  task: OrchestrationSummary["tasks"][number],
+  summary: Pick<OrchestrationSummary, "live">,
+): TaskTone {
+  if (
+    task.needsInput ||
+    task.status === "failed" ||
+    task.status === "blocked" ||
+    task.status === "interrupted"
+  )
+    return "attention";
+  if (summary.live && activeTaskStatus(task.status)) return "active";
+  if (task.status === "completed") return "done";
+  return "idle";
+}
+
+export type CheckSummary = {
+  passed: number;
+  total: number;
+  failing: CheckResult[];
+  label: string;
+};
+
+/** "2/3 checks passed", with the failing results for a closer look. */
+export function checkSummary(
+  results: CheckResult[] | undefined,
+): CheckSummary | undefined {
+  if (!results?.length) return undefined;
+  const failing = results.filter((check) => !check.passed);
+  const passed = results.length - failing.length;
+  return {
+    passed,
+    total: results.length,
+    failing,
+    label: failing.length
+      ? `${passed}/${results.length} checks passed`
+      : `${results.length === 1 ? "Check" : "Checks"} passed`,
+  };
+}
+
+const plural = (count: number, word: string) =>
+  `${count} ${word}${count === 1 ? "" : "s"}`;
+
+/** "4m · 3 turns · 12k tokens", or undefined before the first turn. */
+export function taskUsageText(
+  task: Pick<OrchestrationTask, "activeMs" | "turns" | "tokens">,
+): string | undefined {
+  if (!task.turns) return undefined;
+  return [
+    formatDuration(task.activeMs ?? 0),
+    plural(task.turns, "turn"),
+    task.tokens
+      ? `${formatTokens(task.tokens.input + task.tokens.output)} tokens`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** Run totals for the sidebar; undefined until a worker has taken a turn. */
+export function runUsageLine(
+  run: OrchestrationRun,
+  now = Date.now(),
+): string | undefined {
+  const usage = orchestrationUsage(run, now);
+  if (!usage.workerTurns) return undefined;
+  return [
+    `${formatDuration(usage.elapsedMs)} elapsed`,
+    plural(usage.workerTurns, "worker turn"),
+    usage.tokens
+      ? `${formatTokens(usage.tokens.input + usage.tokens.output)} tokens`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** Review tasks that read `taskId`, with their verdicts once they finish. */
+export function taskReviews(run: OrchestrationRun, taskId: string) {
+  return run.tasks
+    .filter(
+      (entry) => entry.kind === "review" && entry.reviewOf?.includes(taskId),
+    )
+    .map((entry) => ({
+      sessionId: entry.sessionId,
+      title: entry.title,
+      verdict: reviewVerdict(entry),
+    }));
+}
+
+const BUDGET_PAUSE = "Run budget reached: ";
+
+/** What ran out, when the run is paused on its budget. */
+export function budgetPauseDetail(
+  run: Pick<OrchestrationRun, "status" | "error">,
+): string | undefined {
+  if (run.status !== "paused" || !run.error?.startsWith(BUDGET_PAUSE))
+    return undefined;
+  return run.error.slice(BUDGET_PAUSE.length).split(".")[0];
 }
 
 /** One line for lead wake-ups. */

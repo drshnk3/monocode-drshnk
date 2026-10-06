@@ -4,6 +4,8 @@ import {
   leadResultFields,
   leadResultText,
   parseWorkerReport,
+  workerVisibleBlocks,
+  workerVisibleText,
 } from "./orchestrationReport";
 import type { OrchestrationTask } from "./orchestrationState";
 
@@ -160,5 +162,46 @@ describe("worker reports", () => {
     expect(leadResultText(plain, 100)).toContain(`${"x".repeat(97)}END`);
     expect(leadResultText(plain, 100)).not.toContain("x".repeat(101));
     expect(leadResultFields(plain, 100).result).toHaveLength(100);
+  });
+});
+
+describe("worker transcript text", () => {
+  const block = `<monocode_result>${JSON.stringify({
+    ...report,
+    checks: [
+      { command: "npm test", passed: true },
+      { command: "tsc", passed: false },
+    ],
+  })}</monocode_result>`;
+
+  it("replaces the result block with one status line", () => {
+    expect(workerVisibleText(`Done with the screen.\n\n${block}`)).toBe(
+      "Done with the screen.\n\n_Result: done · 1 changed file · 1/2 checks passed_",
+    );
+    expect(workerVisibleText(`Done.\n\`\`\`json\n${block}\n\`\`\``)).toBe(
+      "Done.\n\n_Result: done · 1 changed file · 1/2 checks passed_",
+    );
+  });
+
+  it("hides a malformed or still-streaming block and leaves plain text alone", () => {
+    expect(workerVisibleText("Done.\n<monocode_result>{oops</monocode_result>")).toBe(
+      "Done.",
+    );
+    expect(workerVisibleText('Working on it\n<monocode_result>{"status":"do')).toBe(
+      "Working on it",
+    );
+    expect(workerVisibleText("No report here")).toBe("No report here");
+  });
+
+  it("only touches assistant blocks and keeps identity when nothing changes", () => {
+    const blocks = [
+      { role: "user", text: `quoted ${block}` },
+      { role: "assistant", text: "plain" },
+    ];
+    expect(workerVisibleBlocks(blocks)).toBe(blocks);
+    const withReport = [...blocks, { role: "assistant", text: block }];
+    const visible = workerVisibleBlocks(withReport);
+    expect(visible[0]).toBe(withReport[0]);
+    expect(visible[2].text).toBe("_Result: done · 1 changed file · 1/2 checks passed_");
   });
 });

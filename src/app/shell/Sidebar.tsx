@@ -64,7 +64,10 @@ import type { OpenFileFn } from "../../features/search/model/search";
 import { sessionDisplayTitle } from "../../features/sessions/model/session";
 import { ParticleText } from "../../shared/ui/ParticleText";
 import { nextUnseenFinishedSessions } from "../../features/sessions/model/sessionDone";
-import { orchestrationTaskLabel } from "../../features/orchestration/model/orchestrationSummary";
+import {
+  orchestrationTaskLabel,
+  orchestrationTaskTone,
+} from "../../features/orchestration/model/orchestrationSummary";
 import {
   orderedSessionActionIds,
   pruneSessionSelection,
@@ -3602,16 +3605,12 @@ const SessionCard = memo(function SessionCard({
                   </span>
                   <span
                     className={`shrink-0 text-[10px] ${
-                      task.needsInput ||
-                      task.status === "failed" ||
-                      task.status === "blocked" ||
-                      task.status === "interrupted"
-                        ? "text-amber-400"
-                        : label === "Working"
-                          ? "text-accent"
-                          : task.status === "completed"
-                            ? "text-emerald-400"
-                            : "text-content/45"
+                      {
+                        attention: "text-amber-400",
+                        active: "text-accent",
+                        done: "text-emerald-400",
+                        idle: "text-content/45",
+                      }[orchestrationTaskTone(task, orchestration)]
                     }`}
                   >
                     {label}

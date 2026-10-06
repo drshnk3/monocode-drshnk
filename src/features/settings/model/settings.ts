@@ -26,6 +26,7 @@ export type SettingsSectionId =
   | "providers"
   | "mcp"
   | "skills"
+  | "orchestration"
   | "inbox"
   | "worktrees"
   | "archive";
@@ -113,6 +114,15 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     description:
       "Discover and manage file skills from project, personal, and harness folders.",
     keywords: "skill instructions prompt",
+  },
+  {
+    id: "orchestration",
+    group: "agents",
+    label: "Orchestration",
+    description:
+      "Run limits, worker checkouts, quick starts and saved plan templates for /orchestrator.",
+    keywords:
+      "orchestrator workers lead parallel limits budget worktree dependencies node_modules template quick auto-accept",
   },
   {
     id: "inbox",
@@ -395,6 +405,36 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     section: "providers",
     label: "Claude Code hooks",
     keywords: "pretooluse settings.json block command notification",
+  },
+  {
+    id: "orchestration-defaults",
+    section: "orchestration",
+    label: "Orchestration defaults",
+    keywords: "quick mode auto-accept auto start confirm proposal",
+  },
+  {
+    id: "orchestration-prewarm",
+    section: "orchestration",
+    label: "Prepare worker checkouts early",
+    keywords: "pre-warm prewarm worktree start faster",
+  },
+  {
+    id: "orchestration-dependencies",
+    section: "orchestration",
+    label: "Dependency folders",
+    keywords: "node_modules venv clone worker worktree",
+  },
+  {
+    id: "orchestration-limits",
+    section: "orchestration",
+    label: "Run limits",
+    keywords: "parallel workers tasks commands wake-ups check timeout retries",
+  },
+  {
+    id: "orchestration-templates",
+    section: "orchestration",
+    label: "Plan templates",
+    keywords: "saved plan rename delete reuse",
   },
   {
     id: "project-notifications",

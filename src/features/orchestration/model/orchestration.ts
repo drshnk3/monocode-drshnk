@@ -627,6 +627,35 @@ export class Orchestrator {
   resumeLeadBusy(leadId: string): boolean {
     return !!this.host?.session(leadId)?.busy;
   }
+  /**
+   * Whether the lead's run references this checkout, from memory or its saved
+   * history, without hydrating (which would stop and pause a saved run). Any
+   * doubt, including an unreadable history, answers true.
+   */
+  async ownsWorktree(
+    leadId: string,
+    path: string,
+    branch?: string,
+  ): Promise<boolean> {
+    let run = this.run(leadId);
+    if (!run) {
+      try {
+        run = (await this.store.load(leadId)) ?? undefined;
+      } catch {
+        return true;
+      }
+    }
+    if (!run) return false;
+    const key = orchestrationPathKey(path);
+    const matches = (workspace?: OrchestrationWorkspace) =>
+      !!workspace &&
+      (orchestrationPathKey(workspace.checkoutCwd) === key ||
+        (!!branch && workspace.branch === branch));
+    return (
+      run.tasks.some((task) => matches(task.workspace)) ||
+      (run.dispatches ?? []).some((dispatch) => matches(dispatch.workspace))
+    );
+  }
   private emit() {
     for (const listener of this.listeners) listener();
   }
@@ -916,7 +945,9 @@ export class Orchestrator {
       throw new Error("Review a completed proposal before starting");
     const limits = resolveOrchestrationLimits(overrides);
     const settings = validateOrchestrationSettings(proposal.settings, limits);
-    const budget = validateOrchestrationBudget(options?.budget);
+    const budget = validateOrchestrationBudget(
+      options?.budget ?? settings.budget,
+    );
     const autoAccept = options?.autoAccept ?? settings.autoAccept ?? false;
     const planned = validateProposedTasks(
       proposal.tasks,

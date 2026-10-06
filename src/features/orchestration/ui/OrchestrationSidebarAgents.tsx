@@ -1,10 +1,18 @@
 import { useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { findModel } from "../../sessions/model/models";
-import { orchestrator } from "../model/orchestration";
+import { busyTask, orchestrator } from "../model/orchestration";
 import {
+  budgetPauseDetail,
+  checkSummary,
   orchestrationTaskLabel,
+  orchestrationTaskTone,
+  runUsageLine,
+  taskReviews,
+  taskUsageText,
   type OrchestrationSummary,
+  type TaskTone,
 } from "../model/orchestrationSummary";
+import type { OrchestrationTask } from "../model/orchestrationState";
 import { HARNESS_TITLE } from "../../sessions/model/session";
 import { HarnessIcon } from "../../sessions/ui/HarnessIcon";
 import {
@@ -13,6 +21,116 @@ import {
 } from "./OrchestrationActions";
 import { Check, ChevronDown, ChevronRight, CircleAlert } from "../../../shared/ui/icons";
 import { TerminalSpinner } from "../../sessions/ui/TerminalSpinner";
+
+const TONE_CLASS: Record<TaskTone, string> = {
+  attention: "text-amber-400",
+  active: "text-accent",
+  done: "text-emerald-400",
+  idle: "text-content/45",
+};
+
+/** Checks, reviews, acceptance and usage of one live task, in a few lines. */
+function TaskOutcome({
+  task,
+  reviews,
+}: {
+  task: OrchestrationTask;
+  reviews: ReturnType<typeof taskReviews>;
+}) {
+  const [output, setOutput] = useState(false);
+  const checks = checkSummary(task.checkResults);
+  const usage = taskUsageText(task);
+  const failing = checks?.failing ?? [];
+  const retries = task.checkRetries ? (
+    <span className="text-content/35">
+      · {task.checkRetries} fix {task.checkRetries === 1 ? "turn" : "turns"}
+    </span>
+  ) : null;
+  if (
+    !checks &&
+    !usage &&
+    !reviews.length &&
+    !task.autoAccepted &&
+    !task.autoAcceptError
+  )
+    return null;
+  return (
+    <div className="space-y-1 text-[11px] leading-4 text-content/45">
+      {checks && (
+        <div>
+          {failing.length ? (
+            <button
+              type="button"
+              aria-expanded={output}
+              title={`Failing: ${failing.map((check) => check.command).join(", ")}`}
+              onClick={() => setOutput(!output)}
+              className="flex items-center gap-1 text-amber-400 hover:text-amber-300"
+            >
+              <CircleAlert className="size-3" strokeWidth={1.75} />
+              <span>{checks.label}</span>
+              {retries}
+            </button>
+          ) : (
+            <p
+              className="flex items-center gap-1"
+              title={task.checkResults?.map((check) => check.command).join("\n")}
+            >
+              <Check className="size-3" strokeWidth={2.25} />
+              <span>{checks.label}</span>
+              {retries}
+            </p>
+          )}
+          {output &&
+            failing.map((check) => (
+              <div key={check.command} className="mt-1">
+                <code className="block truncate font-mono text-content/60">
+                  {check.command}
+                  {check.timedOut
+                    ? " · timed out"
+                    : check.exitCode != null
+                      ? ` · exit ${check.exitCode}`
+                      : ""}
+                </code>
+                {check.outputTail.trim() && (
+                  <pre className="mt-0.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-content/5 p-1.5 font-mono text-[10px] leading-4 text-content/55">
+                    {check.outputTail.trim().slice(-1500)}
+                  </pre>
+                )}
+              </div>
+            ))}
+        </div>
+      )}
+      {reviews.map((review) => (
+        <p
+          key={review.sessionId}
+          className={
+            review.verdict === "approved"
+              ? "text-emerald-400"
+              : review.verdict === "changes requested"
+                ? "text-amber-400"
+                : undefined
+          }
+        >
+          {review.title} ·{" "}
+          {review.verdict
+            ? review.verdict === "approved"
+              ? "Approved"
+              : review.verdict === "changes requested"
+                ? "Changes requested"
+                : "No verdict"
+            : "Reviewing"}
+        </p>
+      ))}
+      {task.autoAccepted && <p className="text-emerald-400">Auto-accepted</p>}
+      {task.autoAcceptError && (
+        <p className="text-amber-400">
+          Auto-accept failed: {task.autoAcceptError}
+        </p>
+      )}
+      {usage && <p className="tabular-nums">{usage}</p>}
+    </div>
+  );
+}
 
 export function OrchestrationSidebarAgents({
   leadId,
@@ -53,9 +171,10 @@ export function OrchestrationSidebarAgents({
   };
   // A saved run has no live entry, so the card stays read-only after a reload.
   const run = runs.find((entry) => entry.leadId === leadId);
-  const stopping = !!run?.tasks.some(
-    (task) => task.status === "running" || task.status === "cancelling",
-  );
+  // Checks hold the task's scope too, so they count as work still running.
+  const stopping = !!run?.tasks.some(busyTask);
+  const budgetDetail = run ? budgetPauseDetail(run) : undefined;
+  const usageLine = run ? runUsageLine(run) : undefined;
   const resumeBlocker =
     run?.status === "paused" ? orchestrator.resumeBlocker(leadId) : undefined;
   const leadBusy =
@@ -112,8 +231,8 @@ export function OrchestrationSidebarAgents({
             (entry) => entry.sessionId === task.sessionId,
           );
           const label = orchestrationTaskLabel(task, summary);
-          const working =
-            summary.live && task.status === "running" && !task.needsInput;
+          const tone = orchestrationTaskTone(task, summary);
+          const working = tone === "active";
           // A saved provider model may not be in this window's catalog yet.
           // Keep its identity instead of substituting the harness default.
           const model = findModel(task.model)?.name ?? task.model;
@@ -157,23 +276,9 @@ export function OrchestrationSidebarAgents({
                   {task.title}
                 </span>
                 <span
-                  className={`flex shrink-0 items-center gap-1 text-[11px] ${
-                    task.needsInput ||
-                    task.status === "failed" ||
-                    task.status === "blocked" ||
-                    task.status === "interrupted"
-                      ? "text-amber-400"
-                      : working
-                        ? "text-accent"
-                        : task.status === "completed"
-                          ? "text-emerald-400"
-                          : "text-content/45"
-                  }`}
+                  className={`flex shrink-0 items-center gap-1 text-[11px] ${TONE_CLASS[tone]}`}
                 >
-                  {task.needsInput ||
-                  task.status === "failed" ||
-                  task.status === "blocked" ||
-                  task.status === "interrupted" ? (
+                  {tone === "attention" ? (
                     <CircleAlert className="size-3" strokeWidth={1.75} />
                   ) : working ? (
                     <TerminalSpinner className="inline-block w-3 select-none text-center text-[11px] leading-none text-accent" />
@@ -198,6 +303,12 @@ export function OrchestrationSidebarAgents({
                   </p>
                   {live?.error && (
                     <p className="text-[11px] text-red-400">{live.error}</p>
+                  )}
+                  {live && run && (
+                    <TaskOutcome
+                      task={live}
+                      reviews={taskReviews(run, live.id)}
+                    />
                   )}
                   <div className="flex flex-wrap items-center gap-1">
                     {workers.openDetails && (
@@ -238,7 +349,15 @@ export function OrchestrationSidebarAgents({
           );
         })}
       </div>
-      {(error || run?.error) && (
+      {usageLine && (
+        <p
+          className="px-0.5 pt-1 text-[11px] tabular-nums text-content/40"
+          title="Run time · worker turns, including automatic check fixes · provider-reported tokens"
+        >
+          {usageLine}
+        </p>
+      )}
+      {(error || (run?.error && !budgetDetail)) && (
         <p role="alert" className="py-1 text-[11px] text-red-400">
           {error ?? run?.error}
         </p>
@@ -247,12 +366,19 @@ export function OrchestrationSidebarAgents({
           agents together. Resume has no other home, so it stays. */}
       {run?.status === "paused" && (
         <div className="mt-1.5 space-y-1.5 border-t border-stroke pt-1.5">
+          {budgetDetail && (
+            <p className="px-0.5 text-[11px] leading-relaxed text-amber-400">
+              Budget reached: {budgetDetail}.
+            </p>
+          )}
           <p className="px-0.5 text-[11px] leading-relaxed text-content/45">
             {stopping
               ? "Stopping interrupted work before this run can resume."
               : leadBusy
                 ? "Waiting for the lead's interrupted turn to finish before this run can resume."
-                : "Resume continues interrupted workers from their retained checkouts and starts queued work. Policy-blocked tasks stay stopped for review."}
+                : budgetDetail
+                  ? "Resume grants the same budget again from here and continues interrupted and queued work."
+                  : "Resume continues interrupted workers from their retained checkouts and starts queued work. Policy-blocked tasks stay stopped for review."}
           </p>
           {resumeBlocker && (
             <p className="px-0.5 text-[11px] leading-relaxed text-amber-400">

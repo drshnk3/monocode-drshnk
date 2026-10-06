@@ -368,6 +368,26 @@ import {
 } from "../../../app/model/updater";
 
 import { SkillsPage } from "../../skills/ui/SkillsPage";
+import {
+  DEFAULT_DEPENDENCY_DIRS,
+  loadOrchestrationPreferences,
+  parseDependencyDirs,
+  saveOrchestrationPreferences,
+  type OrchestrationPreferences,
+} from "../model/orchestration";
+import {
+  ORCHESTRATION_LIMIT_RANGES,
+  resolveOrchestrationLimits,
+  type OrchestrationLimits,
+} from "../../orchestration/model/orchestrationLimits";
+import {
+  MAX_TEMPLATE_NAME,
+  deleteOrchestrationTemplate,
+  loadOrchestrationTemplates,
+  renameOrchestrationTemplate,
+  subscribeOrchestrationTemplates,
+  type OrchestrationTemplate,
+} from "../../orchestration/model/orchestrationTemplates";
 import { ProjectNotificationSettings } from "../../notifications/ui/ProjectNotificationSettings";
 import { WorktreesPage } from "../../source-control/ui/WorktreesPage";
 import {
@@ -557,6 +577,7 @@ export function SettingsView({
                 <AppearancePage appearance={appearance} />
               ) : null}
               {section === "chat" ? <ChatPage /> : null}
+              {section === "orchestration" ? <OrchestrationPage /> : null}
               {section === "keybindings" ? <KeybindingsPage /> : null}
               {section === "mcp" ? (
                 <McpSettings cwd={cwd} recents={recents} />
@@ -1136,6 +1157,364 @@ function ChatPage() {
             onChange={onGridArcadeEnabled}
           />
         </Row>
+      </Group>
+    </>
+  );
+}
+
+const ORCHESTRATION_LIMIT_FIELDS: {
+  key: keyof OrchestrationLimits;
+  label: string;
+  description: string;
+  unit?: string;
+  /** Shown in seconds while stored in milliseconds. */
+  seconds?: boolean;
+}[] = [
+  {
+    key: "maxWorkers",
+    label: "Parallel workers",
+    description: "The highest parallelism a proposal card offers.",
+  },
+  {
+    key: "maxTasks",
+    label: "Assignments per run",
+    description: "Including tasks the lead delegates after it starts.",
+  },
+  {
+    key: "maxCommands",
+    label: "Lead commands per run",
+    description: "Changes the lead can make through the control CLI.",
+  },
+  {
+    key: "maxContinuations",
+    label: "Automatic lead wake-ups",
+    description: "Before the run pauses and waits for you.",
+  },
+  {
+    key: "storedResultChars",
+    label: "Stored result length",
+    description: "End of each worker's final message kept in run history.",
+    unit: "chars",
+  },
+  {
+    key: "leadResultChars",
+    label: "Result sent to the lead",
+    description: "Used when a worker finished without a structured report.",
+    unit: "chars",
+  },
+  {
+    key: "wakeBatchMs",
+    label: "Wake-up batching",
+    description: "Workers finishing within this window wake the lead once.",
+    unit: "s",
+    seconds: true,
+  },
+  {
+    key: "checkTimeoutMs",
+    label: "Check timeout",
+    description: "Longest one acceptance check may run before it fails.",
+    unit: "s",
+    seconds: true,
+  },
+  {
+    key: "maxCheckRetries",
+    label: "Automatic fix turns",
+    description: "Turns a worker gets to fix failing checks before the lead decides.",
+  },
+];
+
+/** A number committed on blur or Enter; Settings clamps it to its range. */
+function LimitInput({
+  label,
+  value,
+  min,
+  max,
+  unit,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  unit?: string;
+  /** Returns the value actually saved, after clamping. */
+  onCommit: (value: number) => number;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  const commit = () => {
+    const next = Number(draft.trim());
+    setDraft(
+      String(!draft.trim() || !Number.isFinite(next) ? value : onCommit(next)),
+    );
+  };
+  return (
+    <label className="flex items-center gap-1.5 text-[12px] text-content/50">
+      <input
+        type="number"
+        inputMode="decimal"
+        aria-label={label}
+        title={`${min.toLocaleString()} to ${max.toLocaleString()}`}
+        min={min}
+        max={max}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+        }}
+        className="h-7 w-24 rounded-md border border-content/10 bg-content/[0.04] px-2 text-right text-[12px] tabular-nums text-content outline-none focus:border-accent/45"
+      />
+      {unit ? <span className="w-8">{unit}</span> : <span className="w-8" />}
+    </label>
+  );
+}
+
+function TemplateRow({ template }: { template: OrchestrationTemplate }) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(template.name);
+  const [error, setError] = useState<string | null>(null);
+  const save = () => {
+    try {
+      renameOrchestrationTemplate(template.id, name);
+      setEditing(false);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+  const remove = async () => {
+    const confirmed = await ask(
+      `Delete the template “${template.name}”? Proposals already planned from it are not affected.`,
+      {
+        title: "Delete template",
+        kind: "warning",
+        okLabel: "Delete",
+        cancelLabel: "Cancel",
+      },
+    );
+    if (confirmed) deleteOrchestrationTemplate(template.id);
+  };
+  const tasks = template.tasks.length;
+  const reviews = template.tasks.filter((task) => task.kind === "review").length;
+  return (
+    <Row
+      label={
+        editing ? (
+          <input
+            autoFocus
+            aria-label="Template name"
+            value={name}
+            maxLength={MAX_TEMPLATE_NAME}
+            onChange={(event) => setName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") save();
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                setEditing(false);
+                setName(template.name);
+              }
+            }}
+            className="h-7 w-full max-w-72 rounded-md border border-content/10 bg-content/[0.04] px-2 text-[13px] text-content outline-none focus:border-accent/45"
+          />
+        ) : (
+          template.name
+        )
+      }
+      description={
+        error ??
+        [
+          `${tasks} ${tasks === 1 ? "task" : "tasks"}`,
+          reviews ? `${reviews} ${reviews === 1 ? "review" : "reviews"}` : "",
+          template.savedAt
+            ? `saved ${new Date(template.savedAt).toLocaleDateString()}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      }
+    >
+      {editing ? (
+        <SecondaryButton onClick={save} disabled={!name.trim()}>
+          Save
+        </SecondaryButton>
+      ) : (
+        <SecondaryButton
+          onClick={() => {
+            setName(template.name);
+            setEditing(true);
+          }}
+        >
+          <Pencil className="size-3.5" strokeWidth={1.75} />
+          Rename
+        </SecondaryButton>
+      )}
+      <SecondaryButton danger onClick={() => void remove()}>
+        <Trash2 className="size-3.5" strokeWidth={1.75} />
+        Delete
+      </SecondaryButton>
+    </Row>
+  );
+}
+
+function OrchestrationPage() {
+  const [prefs, setPrefs] = useState<OrchestrationPreferences>(
+    loadOrchestrationPreferences,
+  );
+  const [dirs, setDirs] = useState(() => prefs.dependencyDirs.join(", "));
+  const [dirsError, setDirsError] = useState<string | null>(null);
+  const templates = useSyncExternalStore(
+    subscribeOrchestrationTemplates,
+    loadOrchestrationTemplates,
+    loadOrchestrationTemplates,
+  );
+  const save = (patch: Partial<OrchestrationPreferences>) =>
+    setPrefs(saveOrchestrationPreferences(patch));
+  const commitDirs = () => {
+    const parsed = parseDependencyDirs(dirs);
+    if (parsed.error !== undefined) {
+      setDirsError(parsed.error);
+      return;
+    }
+    setDirsError(null);
+    const next = saveOrchestrationPreferences({ dependencyDirs: parsed.dirs });
+    setPrefs(next);
+    setDirs(next.dependencyDirs.join(", "));
+  };
+
+  return (
+    <>
+      <Group
+        id="orchestration-defaults"
+        title="New proposals"
+        description="How a fresh /orchestrator card starts. You can still change it on the card."
+      >
+        <Row
+          label="Auto-accept when checks pass"
+          description="Cards start with auto-accept on. It only acts on tasks that have checks, and only once all of them pass."
+        >
+          <Toggle
+            label="Auto-accept when checks pass"
+            on={prefs.autoAccept}
+            onChange={(autoAccept) => save({ autoAccept })}
+          />
+        </Row>
+        <Row
+          label="Quick mode"
+          description="Start a valid plan of one or two tasks without a review step as soon as it is ready, exactly as Confirm & start would. The card says it started on its own and Stop ends the run."
+        >
+          <Toggle
+            label="Quick mode"
+            on={prefs.quickMode}
+            onChange={(quickMode) => save({ quickMode })}
+          />
+        </Row>
+      </Group>
+
+      <Group
+        title="Worker checkouts"
+        description="Every worker runs in its own git worktree seeded from the lead's checkout."
+      >
+        <Row
+          id="orchestration-prewarm"
+          label="Prepare worker checkouts early"
+          description="While a card waits for you, create worktrees for the tasks that can start first, one at a time. They are removed if the card is not started."
+        >
+          <Toggle
+            label="Prepare worker checkouts early"
+            on={prefs.prewarm}
+            onChange={(prewarm) => save({ prewarm })}
+          />
+        </Row>
+        <Row
+          id="orchestration-dependencies"
+          label="Dependency folders"
+          description={
+            dirsError ??
+            `Git-ignored folders with these names are cloned copy-on-write into each worker, so tests and type checks run there. Folder names only, separated by commas. Default: ${DEFAULT_DEPENDENCY_DIRS.join(", ")}.`
+          }
+        >
+          <input
+            type="text"
+            aria-label="Dependency folders"
+            aria-invalid={dirsError ? true : undefined}
+            value={dirs}
+            spellCheck={false}
+            placeholder="None"
+            onChange={(event) => {
+              setDirs(event.target.value);
+              setDirsError(null);
+            }}
+            onBlur={commitDirs}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") commitDirs();
+            }}
+            className={`h-7 w-56 rounded-md border bg-content/[0.04] px-2 font-mono text-[11px] text-content outline-none focus:border-accent/45 ${
+              dirsError ? "border-red-400/60" : "border-content/10"
+            }`}
+          />
+        </Row>
+      </Group>
+
+      <Group
+        id="orchestration-limits"
+        title="Run limits"
+        description="Caps for new runs. A run keeps the limits it started with, including when you resume it."
+        action={
+          <button
+            type="button"
+            onClick={() => save({ limits: resolveOrchestrationLimits() })}
+            className="flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] text-content/50 hover:bg-content/10 hover:text-content"
+          >
+            <RotateCcw className="size-3.5" strokeWidth={1.75} />
+            Restore defaults
+          </button>
+        }
+      >
+        {ORCHESTRATION_LIMIT_FIELDS.map((field) => {
+          const [min, max] = ORCHESTRATION_LIMIT_RANGES[field.key];
+          const scale = field.seconds ? 1000 : 1;
+          return (
+            <Row
+              key={field.key}
+              label={field.label}
+              description={field.description}
+            >
+              <LimitInput
+                label={field.label}
+                value={prefs.limits[field.key] / scale}
+                min={min / scale}
+                max={max / scale}
+                unit={field.unit}
+                onCommit={(value) => {
+                  const next = saveOrchestrationPreferences({
+                    limits: { ...prefs.limits, [field.key]: value * scale },
+                  });
+                  setPrefs(next);
+                  return next.limits[field.key] / scale;
+                }}
+              />
+            </Row>
+          );
+        })}
+      </Group>
+
+      <Group
+        id="orchestration-templates"
+        title="Plan templates"
+        description="Saved from a proposal card with Save as template. Choose one beside the orchestrator pill in the composer to plan a new request from its shape."
+      >
+        {templates.length ? (
+          templates.map((template) => (
+            <TemplateRow key={template.id} template={template} />
+          ))
+        ) : (
+          <Row
+            label="No templates yet"
+            description="Save one from a ready or running proposal card."
+          />
+        )}
       </Group>
     </>
   );

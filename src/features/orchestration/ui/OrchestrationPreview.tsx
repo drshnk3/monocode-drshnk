@@ -1,7 +1,7 @@
 import {
   useContext,
   useEffect,
-  useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -10,11 +10,32 @@ import {
 import { HARNESS_TITLE, type Block } from "../../sessions/model/session";
 import type {
   OrchestrationChoice,
+  OrchestrationProposal,
   ProposedTask,
 } from "../model/orchestrationPlan";
 import { orchestrator } from "../model/orchestration";
 import { parallelWorkerOptions } from "../model/orchestrationLimits";
-import { resizeComposer } from "../../sessions/model/composerResize";
+import {
+  cardHasErrors,
+  effectiveAutoAccept,
+  proposalCardErrors,
+  proposalHasChecks,
+  withTaskKind,
+  withoutReviewsOf,
+} from "../model/orchestrationCard";
+import { loadOrchestrationPreferences } from "../../settings/model/orchestration";
+import {
+  BriefSection,
+  GrowingField,
+  InlineError,
+  RunOptions,
+  SaveTemplateButton,
+  TaskChecksField,
+  TaskKindField,
+  cardField,
+  cardFieldLabel,
+  cardSecondary,
+} from "./OrchestrationCardControls";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import {
   findModel,
@@ -401,47 +422,13 @@ function WorkerHelp() {
           </div>
           <div className="mt-1 text-[11px] leading-4 text-content/50">
             The rest of the tasks wait their turn, and a task that depends on
-            another waits for it either way. Every worker edits this same
-            project folder, so a lower number means fewer changes landing in it
-            at the same time.
+            another waits for it either way. Each worker edits its own copy of
+            the project, and its changes land in this folder only when the
+            lead accepts them. A lower number uses less memory and CPU.
           </div>
         </Popover>
       )}
     </>
-  );
-}
-
-function InstructionsField({
-  label,
-  value,
-  className,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  className: string;
-  onChange(value: string): void;
-}) {
-  const ref = useRef<HTMLTextAreaElement>(null);
-  const lockOverscroll = useLockOverscroll<HTMLTextAreaElement>();
-  // The same growth the composer uses: fit the text, stop at `max-h-40` and
-  // scroll from there. The value is controlled, so one layout effect covers
-  // typing and edits that arrive from the lead alike.
-  useLayoutEffect(() => {
-    if (ref.current) resizeComposer(ref.current);
-  }, [value]);
-  return (
-    <textarea
-      ref={(el) => {
-        ref.current = el;
-        lockOverscroll(el);
-      }}
-      rows={1}
-      aria-label={label}
-      className={`${className} max-h-40 resize-none overscroll-none`}
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-    />
   );
 }
 
@@ -473,8 +460,22 @@ export function OrchestrationPreview({
         .hydrate(proposal.leadId)
         .catch((reason: unknown) => setError(String(reason)));
   }, [actions, proposal.leadId]);
+  // Read once per card: Settings changes apply to the next card.
+  const limits = useMemo(() => loadOrchestrationPreferences().limits, []);
+  // Scopes a task had before it became a reviewer, restored if it goes back.
+  const workFiles = useRef(new Map<string, string[]>());
   const editable =
     proposal.status === "ready" && !run && !pending && !busy && !!actions;
+  const errors = useMemo(
+    () =>
+      proposal.status === "ready"
+        ? proposalCardErrors(proposal, limits)
+        : { tasks: {} as Record<string, string> },
+    [proposal, limits],
+  );
+  const blocked = cardHasErrors(errors);
+  const hasChecks = proposalHasChecks(proposal);
+  const autoAccept = effectiveAutoAccept(proposal);
   const planning = proposal.status === "planning";
   const starting = pending || proposal.status === "starting";
   const visible = showAll ? proposal.tasks : proposal.tasks.slice(0, 3);
@@ -489,20 +490,37 @@ export function OrchestrationPreview({
       setPending(false);
     }
   };
-  const change = (id: string, patch: Partial<ProposedTask>) => {
+  const update = (patch: Partial<OrchestrationProposal>) => {
     setError(undefined);
-    actions?.update(proposal.leadId, block.id, {
-      ...proposal,
+    actions?.update(proposal.leadId, block.id, { ...proposal, ...patch });
+  };
+  const change = (id: string, patch: Partial<ProposedTask>) =>
+    update({
       tasks: proposal.tasks.map((task) =>
         task.id === id ? { ...task, ...patch } : task,
       ),
     });
+  const changeKind = (task: ProposedTask, kind: "work" | "review") => {
+    if (kind === "review" && task.kind !== "review")
+      workFiles.current.set(task.id, task.files);
+    const next = withTaskKind(
+      task,
+      kind,
+      proposal,
+      workFiles.current.get(task.id),
+    );
+    const tasks = proposal.tasks.map((entry) =>
+      entry.id === task.id ? next : entry,
+    );
+    update({
+      tasks: kind === "review" ? withoutReviewsOf(tasks, task.id) : tasks,
+    });
   };
-  const secondary =
-    "flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[11px] text-content/50 hover:bg-content/8 hover:text-content disabled:opacity-35";
-  const field =
-    "w-full rounded-md border border-content/12 bg-background-base/40 px-2 py-1.5 text-[12px] leading-5 text-content outline-none placeholder:text-content/35 focus:border-content/30";
-  const fieldLabel = "mb-1 block text-[11px] leading-tight text-content/45";
+  const titleOf = (id: string) =>
+    proposal.tasks.find((entry) => entry.id === id)?.title ?? id;
+  const secondary = cardSecondary;
+  const field = cardField;
+  const fieldLabel = cardFieldLabel;
   return (
     <div
       className="mb-2 overflow-hidden rounded-xl border border-content/10 bg-content/3 font-sans"
@@ -538,9 +556,22 @@ export function OrchestrationPreview({
                 {proposal.tasks.length === 1 ? "task" : "tasks"}
               </span>
             )}
+            {proposal.template && (
+              <span
+                className="min-w-0 truncate"
+                title={`Planned from the template “${proposal.template.name}”`}
+              >
+                · from {proposal.template.name}
+              </span>
+            )}
           </div>
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
+          {!planning &&
+            !!proposal.tasks.length &&
+            ["ready", "approved"].includes(proposal.status) && (
+              <SaveTemplateButton proposal={proposal} />
+            )}
           {!run && proposal.status === "invalid" && (
             <button
               className={secondary}
@@ -553,7 +584,8 @@ export function OrchestrationPreview({
           {!run && ["ready", "starting"].includes(proposal.status) && (
             <button
               className="flex h-7 items-center gap-1.5 rounded-md bg-content px-2.5 text-[11px] font-medium text-background-base hover:bg-content/80 disabled:opacity-40"
-              disabled={!editable}
+              disabled={!editable || blocked}
+              title={blocked ? "Fix the highlighted problems first" : undefined}
               onClick={() =>
                 void perform(() => actions!.confirm(proposal.leadId, block.id))
               }
@@ -587,6 +619,36 @@ export function OrchestrationPreview({
             ? "Your lead is choosing tasks and worker models. Review the assignments here before starting."
             : "Checking available harnesses and models…"}
         </p>
+      )}
+      {proposal.autoStarted && (
+        <div className="flex items-center gap-2 border-t border-stroke px-3 py-1.5 text-[11px] text-content/50">
+          <span className="min-w-0 flex-1">
+            Quick mode started this plan automatically.
+          </span>
+          {run && (run.status === "active" || run.status === "paused") && (
+            <button
+              type="button"
+              className={secondary}
+              onClick={() =>
+                void perform(
+                  () =>
+                    orchestrator.stopForSession(proposal.leadId) ??
+                    Promise.resolve(),
+                )
+              }
+            >
+              Stop run
+            </button>
+          )}
+        </div>
+      )}
+      {!planning && (
+        <BriefSection
+          brief={proposal.brief}
+          editable={editable}
+          error={errors.brief}
+          onChange={(brief) => update({ brief })}
+        />
       )}
       {!!proposal.tasks.length && (
         <ul className="border-t border-stroke py-1">
@@ -623,9 +685,23 @@ export function OrchestrationPreview({
                     ) : (
                       <ChevronRight className="size-3.5 shrink-0" />
                     )}
+                    {task.kind === "review" && (
+                      <span className="shrink-0 rounded bg-content/8 px-1 text-[10px] leading-4 text-content/55">
+                        Review
+                      </span>
+                    )}
                     <span className="truncate text-[12px]" title={task.title}>
                       {task.title}
                     </span>
+                    {!!task.checks?.length && (
+                      <span
+                        className="shrink-0 text-[11px] text-content/35"
+                        title={task.checks.join("\n")}
+                      >
+                        · {task.checks.length}{" "}
+                        {task.checks.length === 1 ? "check" : "checks"}
+                      </span>
+                    )}
                   </button>
                   <div className="max-w-[60%] min-w-0">
                     {editable ? (
@@ -657,6 +733,11 @@ export function OrchestrationPreview({
                     )}
                   </div>
                 </div>
+                {errors.tasks[task.id] && (
+                  <div className="px-3 pb-1.5 pl-8">
+                    <InlineError message={errors.tasks[task.id]} />
+                  </div>
+                )}
                 {open && (
                   <div className="space-y-2.5 px-3 pb-3 pl-8 text-[11px] leading-4 text-content/45">
                     {editable ? (
@@ -674,30 +755,59 @@ export function OrchestrationPreview({
                         </label>
                         <label className="block">
                           <span className={fieldLabel}>Instructions</span>
-                          <InstructionsField
+                          <GrowingField
                             label={`Instructions for task ${index + 1}`}
                             value={task.prompt}
                             className={field}
                             onChange={(prompt) => change(task.id, { prompt })}
                           />
                         </label>
+                        <TaskKindField
+                          task={task}
+                          index={index}
+                          proposal={proposal}
+                          onKind={(kind) => changeKind(task, kind)}
+                          onReviewOf={(reviewOf) =>
+                            change(task.id, { reviewOf })
+                          }
+                        />
+                        {task.kind !== "review" && (
+                          <TaskChecksField
+                            checks={task.checks ?? []}
+                            index={index}
+                            onChange={(checks) => change(task.id, { checks })}
+                          />
+                        )}
                       </>
                     ) : (
-                      <p className="whitespace-pre-wrap text-[12px] leading-5 text-content/60">
-                        {task.prompt}
-                      </p>
+                      <>
+                        <p className="whitespace-pre-wrap text-[12px] leading-5 text-content/60">
+                          {task.prompt}
+                        </p>
+                        {task.kind === "review" && (
+                          <p>
+                            Reviews ·{" "}
+                            {(task.reviewOf ?? []).map(titleOf).join(", ")}
+                          </p>
+                        )}
+                        {!!task.checks?.length && (
+                          <div>
+                            <span>Checks</span>
+                            {task.checks.map((command) => (
+                              <code
+                                key={command}
+                                className="mt-0.5 block truncate font-mono text-[11px] text-content/55"
+                                title={command}
+                              >
+                                {command}
+                              </code>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     )}
                     {!!task.dependsOn.length && (
-                      <p>
-                        After ·{" "}
-                        {task.dependsOn
-                          .map(
-                            (id) =>
-                              proposal.tasks.find((entry) => entry.id === id)
-                                ?.title ?? id,
-                          )
-                          .join(", ")}
-                      </p>
+                      <p>After · {task.dependsOn.map(titleOf).join(", ")}</p>
                     )}
                   </div>
                 )}
@@ -723,10 +833,22 @@ export function OrchestrationPreview({
             : `Show ${proposal.tasks.length - 3} more ${proposal.tasks.length === 4 ? "task" : "tasks"}`}
         </button>
       )}
-      {(error || proposal.error) && (
+      {(error || proposal.error || errors.general) && (
         <p role="alert" className="px-3 py-2 text-[12px] text-red-400">
-          {error ?? proposal.error}
+          {error ?? proposal.error ?? errors.general}
         </p>
+      )}
+      {!planning && !!proposal.tasks.length && (
+        <RunOptions
+          proposal={proposal}
+          editable={editable}
+          hasChecks={hasChecks}
+          autoAccept={autoAccept}
+          error={errors.budget}
+          onSettings={(patch) =>
+            update({ settings: { ...proposal.settings, ...patch } })
+          }
+        />
       )}
       {!planning && (
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-stroke px-3 py-2 text-[11px] text-content/45">
@@ -739,7 +861,7 @@ export function OrchestrationPreview({
                   aria-label="Parallel workers"
                   className="flex items-center gap-0.5 rounded-md bg-content/5 p-0.5"
                 >
-                  {parallelWorkerOptions().map((number) => (
+                  {parallelWorkerOptions(limits).map((number) => (
                     <button
                       key={number}
                       type="button"
@@ -777,7 +899,7 @@ export function OrchestrationPreview({
                 : proposal.status === "ready"
                   ? "Awaiting confirmation"
                   : "")}{" "}
-            · Shared project folder
+            · Isolated worker copies
           </span>
         </div>
       )}

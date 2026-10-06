@@ -68,6 +68,7 @@ import {
   resetHarnessModelOverlays,
 } from "../../sessions/model/models";
 import type { OrchestrationProposal } from "../model/orchestrationPlan";
+import { saveOrchestrationTemplate } from "../model/orchestrationTemplates";
 import { invoke } from "@tauri-apps/api/core";
 
 const emptyRuns: OrchestrationRun[] = [];
@@ -241,6 +242,68 @@ describe("orchestration composer and card", () => {
         .mocked(invoke)
         .mock.calls.some(([command]) => command === "control_enable"),
     ).toBe(false);
+  });
+  it("plans from a saved template chosen beside the orchestrator pill", async () => {
+    saveOrchestrationTemplate({
+      id: "tpl",
+      name: "Settings flow",
+      savedAt: 1,
+      summary: "",
+      tasks: [
+        {
+          id: "ui",
+          title: "UI",
+          prompt: "Build",
+          harness: "codex",
+          model: "codex:one",
+          files: ["src"],
+          dependsOn: [],
+        },
+      ],
+    });
+    const submit = vi.fn();
+    await act(async () =>
+      root.render(
+        createElement(Composer, {
+          focused: false,
+          harness: "codex",
+          model: modelsFor("codex")[0].id,
+          runtimeMode: "supervised",
+          cwd: "/repo",
+          executionCwd: "/repo",
+          sessionId: "lead",
+          initialDraft: "Add a profile page",
+          hideProjectPicker: true,
+          hideBranchPicker: true,
+          onFocus: () => {},
+          onCwdChange: () => {},
+          onModelChange: () => {},
+          onRuntimeModeChange: () => {},
+          onSubmit: submit,
+        }),
+      ),
+    );
+    // Nothing extra until orchestration is on.
+    expect(
+      document.querySelector('[aria-label="Plan from a template"]'),
+    ).toBeNull();
+    await click(
+      document.querySelector(
+        'button[aria-label="Add files or choose a mode"]',
+      )!,
+    );
+    await click(button("Orchestrator"));
+    await click(document.querySelector('[aria-label="Plan from a template"]')!);
+    await click(
+      [...document.querySelectorAll('[role="option"]')].find((option) =>
+        option.textContent?.includes("Settings flow"),
+      )!,
+    );
+    await press(container.querySelector("textarea")!, "Enter");
+    expect(submit).toHaveBeenCalledWith("Add a profile page", [], {
+      intent: "orchestrate",
+      orchestrationTemplateId: "tpl",
+    });
   });
   it("preserves the draft and selected mode when the app rejects submission", async () => {
     const model = modelsFor("codex")[0];
@@ -932,5 +995,210 @@ describe("orchestration composer and card", () => {
     expect(button("Resume").hasAttribute("disabled")).toBe(true);
     await click(button("Open blocker"));
     expect(open).toHaveBeenCalledWith("investigation");
+  });
+
+  it("edits the brief, checks and run options, and blocks Confirm on inline errors", async () => {
+    const choices = [
+      { harness: "codex" as const, model: "codex:one", name: "Worker One" },
+    ];
+    const initial: OrchestrationProposal = {
+      version: 1,
+      leadId: "lead",
+      cwd: "/repo",
+      request: "Build",
+      author: choices[0],
+      settings: { choices, maxWorkers: 2 },
+      status: "ready",
+      title: "Build settings",
+      summary: "",
+      brief: "Use the shared Toggle.",
+      tasks: [
+        {
+          id: "ui",
+          title: "Settings UI",
+          prompt: "Build the form",
+          harness: "codex",
+          model: "codex:one",
+          files: ["src/settings"],
+          dependsOn: [],
+        },
+      ],
+    };
+    const confirm = vi.fn(async (_proposal: OrchestrationProposal) => {});
+    function Card() {
+      const [proposal, setProposal] = useState(initial);
+      return createElement(
+        OrchestrationActions.Provider,
+        {
+          value: {
+            update: (_id, _block, edited) => setProposal(edited),
+            confirm: async () => confirm(proposal),
+            retry: () => {},
+            open: () => {},
+          },
+        },
+        createElement(AgentTranscript, {
+          blocks: [
+            { id: "card", role: "plan", text: "", orchestration: proposal },
+          ],
+        }),
+      );
+    }
+    await act(async () => root.render(createElement(Card)));
+    // Without checks, auto-accept has nothing to act on.
+    const autoAccept = container.querySelector<HTMLButtonElement>(
+      '[role="switch"]',
+    )!;
+    expect(autoAccept.disabled).toBe(true);
+    await click(button("Brief"));
+    await input(
+      document.querySelector('[aria-label="Run brief"]')!,
+      "Use the shared Toggle and the settings store.",
+    );
+    await click(
+      document.querySelector('[aria-label="Details for Settings UI"]')!,
+    );
+    await click(button("Add check"));
+    expect(container.textContent).toContain("non-empty command");
+    expect(button("Confirm & start").disabled).toBe(true);
+    await input(
+      document.querySelector('[aria-label="Check 1 for task 1"]')!,
+      "npx vitest run src/settings",
+    );
+    expect(container.textContent).not.toContain("non-empty command");
+    expect(autoAccept.disabled).toBe(false);
+    await click(autoAccept);
+    await input(document.querySelector('[aria-label="Budget min"]')!, "0");
+    expect(container.textContent).toContain("maxMinutes");
+    expect(button("Confirm & start").disabled).toBe(true);
+    await input(document.querySelector('[aria-label="Budget min"]')!, "30");
+    await click(button("Confirm & start"));
+    expect(confirm).toHaveBeenCalledWith(
+      expect.objectContaining({
+        brief: "Use the shared Toggle and the settings store.",
+        settings: expect.objectContaining({
+          autoAccept: true,
+          budget: { maxMinutes: 30 },
+        }),
+        tasks: [
+          expect.objectContaining({ checks: ["npx vitest run src/settings"] }),
+        ],
+      }),
+    );
+  });
+
+  it("shows checks, review verdicts, auto-accept and usage for live agents", async () => {
+    const base = {
+      harness: "codex" as const,
+      model: "codex:two",
+      prompt: "Do it",
+      scopes: [],
+      dependsOn: [],
+      accepted: false,
+      delivered: true,
+      result: "",
+    };
+    const tasks: OrchestrationTask[] = [
+      {
+        ...base,
+        id: "ui",
+        sessionId: "ui-worker",
+        title: "UI worker",
+        files: ["src"],
+        status: "checking",
+        turns: 2,
+        activeMs: 120_000,
+        checkResults: [
+          {
+            command: "npm test",
+            passed: true,
+            exitCode: 0,
+            timedOut: false,
+            durationMs: 1000,
+            outputTail: "",
+          },
+          {
+            command: "npx tsc --noEmit",
+            passed: false,
+            exitCode: 2,
+            timedOut: false,
+            durationMs: 3000,
+            outputTail: "error TS2322: nope",
+          },
+        ],
+      },
+      {
+        ...base,
+        id: "api",
+        sessionId: "api-worker",
+        title: "API worker",
+        files: ["api"],
+        status: "completed",
+        accepted: true,
+        autoAccepted: true,
+      },
+      {
+        ...base,
+        id: "review",
+        sessionId: "reviewer",
+        title: "Review API",
+        files: [],
+        kind: "review",
+        reviewOf: ["api"],
+        status: "completed",
+        report: {
+          status: "partial",
+          summary: "Needs a test",
+          changedFiles: [],
+          checks: [],
+          blockers: ["Add a test"],
+        },
+      },
+    ];
+    emptyRuns.push({
+      version: 2,
+      leadId: "lead",
+      cwd: "/repo",
+      status: "active",
+      allowedHarnesses: ["codex"],
+      maxWorkers: 2,
+      cli: "monocode",
+      tasks,
+      continuations: 0,
+      requests: {},
+      activeMs: 300_000,
+    });
+    const summary: OrchestrationSummary = {
+      status: "active",
+      live: true,
+      tasks: tasks.map(({ sessionId, title, harness, model, status }) => ({
+        sessionId,
+        title,
+        harness,
+        model,
+        status,
+      })),
+    };
+    await act(async () =>
+      root.render(
+        createElement(OrchestrationSidebarAgents, { leadId: "lead", summary }),
+      ),
+    );
+    expect(container.textContent).toContain("Checking");
+    expect(container.textContent).toContain(
+      "5m elapsed · 2 worker turns",
+    );
+    await click(
+      container.querySelector('[aria-label="Agent details: UI worker"]')!,
+    );
+    expect(container.textContent).toContain("1/2 checks passed");
+    expect(container.textContent).toContain("2m · 2 turns");
+    await click(button("1/2 checks passed"));
+    expect(container.textContent).toContain("error TS2322: nope");
+    await click(
+      container.querySelector('[aria-label="Agent details: API worker"]')!,
+    );
+    expect(container.textContent).toContain("Auto-accepted");
+    expect(container.textContent).toContain("Review API · Changes requested");
   });
 });

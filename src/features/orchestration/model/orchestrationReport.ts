@@ -115,6 +115,57 @@ export function parseWorkerReport(text: string): {
   return { report, text: text.replace(FENCED_RESULT_BLOCK, "").trimEnd() };
 }
 
+/** An opening tag with no close yet: the block is still streaming in. */
+const OPEN_RESULT_TAIL =
+  /(?:\r?\n[ \t]*)*(?:```[\w-]*[ \t]*\r?\n[ \t]*)?<monocode_result\b[^>]*>(?![\s\S]*<\/monocode_result>)[\s\S]*$/i;
+
+const reportLine = (report: WorkerReport) =>
+  `_${[
+    `Result: ${report.status}`,
+    report.changedFiles.length
+      ? `${report.changedFiles.length} changed file${report.changedFiles.length === 1 ? "" : "s"}`
+      : "",
+    report.checks.length
+      ? `${report.checks.filter((check) => check.passed).length}/${report.checks.length} checks passed`
+      : "",
+    report.blockers.length
+      ? `${report.blockers.length} blocker${report.blockers.length === 1 ? "" : "s"}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" · ")}_`;
+
+/**
+ * A worker's message as a person reads it: the `<monocode_result>` JSON the
+ * app parses is replaced by one short status line, and a half-streamed block
+ * is hidden until it completes. Text without a block is returned unchanged.
+ */
+export function workerVisibleText(text: string): string {
+  if (!/<monocode_result\b/i.test(text)) return text;
+  const { report } = parseWorkerReport(text);
+  const stripped = text
+    .replace(FENCED_RESULT_BLOCK, "")
+    .replace(OPEN_RESULT_TAIL, "")
+    .trimEnd();
+  if (!report) return stripped;
+  return stripped ? `${stripped}\n\n${reportLine(report)}` : reportLine(report);
+}
+
+/** Apply `workerVisibleText` to a transcript; unchanged blocks keep identity. */
+export function workerVisibleBlocks<
+  T extends { role: string; text: string },
+>(blocks: T[]): T[] {
+  let changed = false;
+  const next = blocks.map((block) => {
+    if (block.role !== "assistant") return block;
+    const text = workerVisibleText(block.text);
+    if (text === block.text) return block;
+    changed = true;
+    return { ...block, text };
+  });
+  return changed ? next : blocks;
+}
+
 const fileKey = (path: string) =>
   path.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
 

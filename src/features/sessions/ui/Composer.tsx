@@ -172,6 +172,7 @@ import {
   ModeCommandText,
   type ModeCommandToken,
 } from "./modeCommands";
+import { OrchestrationTemplatePicker } from "../../orchestration/ui/OrchestrationTemplatePicker";
 import {
   BTW_COMMAND,
   consumeBtwCommand,
@@ -641,6 +642,8 @@ export function Composer({
   const [planSelected, setPlanSelected] = useState(false);
   const [operatorSelected, setOperatorSelected] = useState(false);
   const [orchestrationSelected, setOrchestrationSelected] = useState(false);
+  const [orchestrationTemplateId, setOrchestrationTemplateId] =
+    useState<string>();
   const [draftSelected, setDraftSelected] = useState(false);
   const [slash, setSlash] = useState<SlashToken | null>(null);
   const [skillActive, setSkillActive] = useState(0);
@@ -1705,6 +1708,12 @@ export function Composer({
             : orchestrationSelected || orchestratorCommand.matched
               ? "orchestrate"
               : "default",
+        ...(!planSelected &&
+        !command.planning &&
+        (orchestrationSelected || orchestratorCommand.matched) &&
+        orchestrationTemplateId
+          ? { orchestrationTemplateId }
+          : {}),
         ...(resendEdited
           ? {
               resendEdited: true,
@@ -1742,6 +1751,7 @@ export function Composer({
     setPlanSelected(false);
     setOperatorSelected(false);
     setOrchestrationSelected(false);
+    setOrchestrationTemplateId(undefined);
     setSessionFolderSelected(false);
     setSessionFolderOpen(false);
     setPlusOpen(false);
@@ -2584,14 +2594,23 @@ export function Composer({
               />
             ) : null}
             {!compact && orchestrationActive ? (
-              <ModeCommandPill
-                name={ORCHESTRATOR_COMMAND.name}
-                onClear={() => {
-                  setOrchestrationSelected(false);
-                  clearLeadingMode(ORCHESTRATOR_COMMAND.name);
-                  ref.current?.focus();
-                }}
-              />
+              <>
+                <ModeCommandPill
+                  name={ORCHESTRATOR_COMMAND.name}
+                  onClear={() => {
+                    setOrchestrationSelected(false);
+                    clearLeadingMode(ORCHESTRATOR_COMMAND.name);
+                    ref.current?.focus();
+                  }}
+                />
+                <OrchestrationTemplatePicker
+                  value={orchestrationTemplateId}
+                  onChange={(id) => {
+                    setOrchestrationTemplateId(id);
+                    ref.current?.focus();
+                  }}
+                />
+              </>
             ) : null}
             {!compact && planActive ? (
               <ModeCommandPill

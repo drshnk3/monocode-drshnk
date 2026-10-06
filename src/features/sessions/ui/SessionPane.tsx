@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -16,6 +17,7 @@ import {
   orchestrator,
   sameCheckout,
 } from "../../orchestration/model/orchestration";
+import { workerVisibleBlocks } from "../../orchestration/model/orchestrationReport";
 import { DiscussionEmpty } from "./DiscussionEmpty";
 import { LinkedWorkItemUpdateNotice } from "../../inbox/ui/LinkedWorkItemUpdateNotice";
 import { SessionReview } from "./SessionReview";
@@ -324,6 +326,13 @@ const LocalSessionPane = memo(function LocalSessionPane({
   );
   const title = sessionDisplayTitle(session.title, session.harness);
   const isEmpty = session.blocks.length === 0;
+  // A worker's result JSON is for its lead; show people a one-line status.
+  const workerLeadId = session.orchestrationLeadId;
+  const transcriptBlocks = useMemo(
+    () =>
+      workerLeadId ? workerVisibleBlocks(session.blocks) : session.blocks,
+    [workerLeadId, session.blocks],
+  );
   const recallLastTurnRef = useRef<(() => void) | null>(null);
   const remote = remoteSession;
   const editLastTurnSupported = !remote && canEditLastTurn(session);
@@ -822,7 +831,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
                 onMouseDown={focusPane}
               >
                 <AgentTranscript
-                  blocks={session.blocks}
+                  blocks={transcriptBlocks}
                   busy={!!session.busy}
                   visible={visible}
                   cwd={workCwd}
